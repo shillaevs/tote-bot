@@ -1,0 +1,171 @@
+{
+  "draw": {
+    "status": "open",
+    "createdAt": "2025-08-15T11:57:50.289Z",
+    "events": [
+      {
+        "idx": 0,
+        "title": "Ливерпуль vs Борнмут",
+        "result": null,
+        "isVoid": false
+      },
+      {
+        "idx": 1,
+        "title": "Жирона vs Райо Вальекано",
+        "result": null,
+        "isVoid": false
+      },
+      {
+        "idx": 2,
+        "title": "Вильярреал vs Овьедо",
+        "result": null,
+        "isVoid": false
+      },
+      {
+        "idx": 3,
+        "title": "Челси vs Манчестер Сити",
+        "result": null,
+        "isVoid": false
+      },
+      {
+        "idx": 4,
+        "title": "Лидс Юнайтед vs Вулверхэмптон",
+        "result": null,
+        "isVoid": false
+      },
+      {
+        "idx": 5,
+        "title": "Вест Хэм Юнайтед vs Эвертон",
+        "result": null,
+        "isVoid": false
+      },
+      {
+        "idx": 6,
+        "title": "Локомотив М vs Краснодар",
+        "result": null,
+        "isVoid": false
+      },
+      {
+        "idx": 7,
+        "title": "Крылья Советов vs ЦСКА",
+        "result": null,
+        "isVoid": false
+      },
+      {
+        "idx": 8,
+        "title": "Балтика vs Рубин",
+        "result": null,
+        "isVoid": false
+      },
+      {
+        "idx": 9,
+        "title": "Акрон vs Зенит",
+        "result": null,
+        "isVoid": false
+      },
+      {
+        "idx": 10,
+        "title": "Динамо М vs Динамо Мх",
+        "result": null,
+        "isVoid": false
+      },
+      {
+        "idx": 11,
+        "title": "Спартак М vs Ахмат",
+        "result": null,
+        "isVoid": false
+      },
+      {
+        "idx": 12,
+        "title": "Ренн vs Марсель",
+        "result": null,
+        "isVoid": false
+      },
+      {
+        "idx": 13,
+        "title": "Зонненхоф Гроссаспах vs Байер",
+        "result": null,
+        "isVoid": false
+      },
+      {
+        "idx": 14,
+        "title": "Марсель vs Лилль",
+        "result": null,
+        "isVoid": false
+      }
+    ],
+    "rolloverPrev": {
+      "12": 0,
+      "13": 0,
+      "14": 0,
+      "15": 0
+    }
+  },
+  "tickets": [
+    {
+      "id": "5084536393-1755264744120",
+      "userId": 5084536393,
+      "paidAmount": 1440,
+      "selections": [
+        [
+          0
+        ],
+        [
+          1
+        ],
+        [
+          0
+        ],
+        [
+          2
+        ],
+        [
+          0
+        ],
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          2
+        ],
+        [
+          2
+        ],
+        [
+          1
+        ],
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          1,
+          2
+        ],
+        [
+          1,
+          2
+        ],
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          1,
+          2
+        ]
+      ],
+      "createdAt": "2025-08-15T13:32:24.120Z"
+    }
+  ],
+  "users": {
+    "5084536393": {
+      "hasTicketForCurrent": true
+    }
+  }
+}
