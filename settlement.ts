@@ -1,17 +1,18 @@
-// settlement.ts — стратегии распределения призов (USDT/TON-агностично)
+// settlement.ts — стратегии распределения призов
+
 export type FormulaName = 'MAX_HITS_EQUAL_SHARE' | 'TIERED_WEIGHTS' | 'FIXED_TABLE';
 
 export interface SettlementInput {
   drawId: string;
-  totalBank: number;         // общая сумма банка (в валюте выплат)
-  maxHitsInDraw: number;     // максимальное число совпадений по итогам
+  totalBank: number;
+  maxHitsInDraw: number;
   hitsByUser: Array<{ userId: number; wallet: string; hits: number }>;
 }
 
 export interface Payout {
   userId: number;
   wallet: string;
-  amount: number;            // сколько выплатить
+  amount: number;
   hits: number;
 }
 
@@ -21,20 +22,24 @@ export interface SettlementResult {
   formulaParams: any;
   prizePool: number;
   payouts: Payout[];
-  leftover: number;          // перенос/резерв
+  leftover: number;
+  maxHitsInDraw: number;
 }
+
+interface MaxHitsParams { prizePoolPct: number; rolloverIfNoWinners: boolean }
+interface TieredParams { prizePoolPct: number; weights: { [hits: string]: number }; minHits: number; rolloverUnclaimed: boolean }
+interface FixedParams { fixed: { [hits: string]: number }; rolloverUnclaimed: boolean }
 
 const FORMULA_VERSION = '1.0.0';
 
 function toMinor(x: number, decimals = 6): bigint {
-  // 1.234567 USDT -> 1234567n
   return BigInt(Math.round(x * Math.pow(10, decimals)));
 }
+
 function fromMinor(x: bigint, decimals = 6): number {
   return Number(x) / Math.pow(10, decimals);
 }
 
-// 1) Равные доли среди победителей с максимальным числом совпадений
 function maxHitsEqualShare(input: SettlementInput, params: any): SettlementResult {
   const prizePoolPct = params?.prizePoolPct ?? 0.90;
   const prizePoolMinor = toMinor(input.totalBank * prizePoolPct);
@@ -47,7 +52,8 @@ function maxHitsEqualShare(input: SettlementInput, params: any): SettlementResul
       formulaParams: params,
       prizePool: fromMinor(prizePoolMinor),
       payouts: [],
-      leftover: fromMinor(prizePoolMinor)
+      leftover: fromMinor(prizePoolMinor),
+	  maxHitsInDraw: input.maxHitsInDraw
     };
   }
 
@@ -68,20 +74,27 @@ function maxHitsEqualShare(input: SettlementInput, params: any): SettlementResul
     formulaParams: params,
     prizePool: fromMinor(prizePoolMinor),
     payouts,
-    leftover: fromMinor(leftoverMinor)
+    leftover: fromMinor(leftoverMinor),
+	maxHitsInDraw: input.maxHitsInDraw
   };
 }
 
-// 2) Многоуровневое распределение по весам (15/14/13...)
-// часть банка делим на "уровни" по весам; в каждом уровне — поровну между победителями уровня
 function tieredWeights(input: SettlementInput, params: any): SettlementResult {
   const prizePoolPct = params?.prizePoolPct ?? 0.90;
-  const weights: Record<string, number> = params?.weights ?? {"15":70,"14":20,"13":10};
+  const weights: Record<string, number> = params?.weights ?? { "15": 70, "14": 20, "13": 10 };
   const minHits = params?.minHits ?? Math.min(...Object.keys(weights).map(k => +k));
-  const prizePoolMinor = toMinor(input.totalBank * prizePoolPct);
+  if (!weights || typeof weights !== 'object' || !minHits) {
+    throw new Error('Invalid TIERED_WEIGHTS params');
+  }
 
+  const prizePoolMinor = toMinor(input.totalBank * prizePoolPct);
   const levels = Object.keys(weights).map(n => +n).filter(h => h <= input.maxHitsInDraw && h >= minHits);
-  const totalWeight = levels.reduce((s,h)=> s + (weights[h]?.valueOf() ?? 0), 0);
+  const winnersByLevel: Record<number, Array<{ userId: number; wallet: string }>> = {};
+  levels.forEach(h => {
+    winnersByLevel[h] = input.hitsByUser.filter(u => u.hits === h);
+  });
+
+  const totalWeight = levels.reduce((s, h) => s + (weights[h] ?? 0) * winnersByLevel[h].length, 0);
   if (totalWeight <= 0) {
     return {
       formulaName: 'TIERED_WEIGHTS',
@@ -89,82 +102,79 @@ function tieredWeights(input: SettlementInput, params: any): SettlementResult {
       formulaParams: params,
       prizePool: fromMinor(prizePoolMinor),
       payouts: [],
-      leftover: fromMinor(prizePoolMinor)
+      leftover: fromMinor(prizePoolMinor),
+	  maxHitsInDraw: input.maxHitsInDraw
     };
   }
 
-  let leftoverMinor = prizePoolMinor;
+  const unitMinor = prizePoolMinor / BigInt(totalWeight);
   const payouts: Payout[] = [];
-
-  for (const h of levels) {
-    const group = input.hitsByUser.filter(x => x.hits === h);
-    if (group.length === 0) continue;
-
-    const poolForLevelMinor = (prizePoolMinor * BigInt(Math.round((weights[h] / totalWeight) * 1e6))) / BigInt(1e6);
-    const shareMinor = poolForLevelMinor / BigInt(group.length);
-    for (const g of group) {
-      payouts.push({
-        userId: g.userId, wallet: g.wallet, hits: g.hits,
-        amount: fromMinor(shareMinor)
-      });
+  let distributedMinor = 0n;
+  for (const hits of levels) {
+    const group = winnersByLevel[hits];
+    if (!group?.length) continue;
+    const weight = weights[hits] || 0;
+    const shareMinor = unitMinor * BigInt(weight);
+    for (const w of group) {
+      payouts.push({ userId: w.userId, wallet: w.wallet, hits, amount: fromMinor(shareMinor) });
     }
-    leftoverMinor -= shareMinor * BigInt(group.length);
+    distributedMinor += shareMinor * BigInt(group.length);
   }
 
+  const leftoverMinor = prizePoolMinor - distributedMinor;
   return {
     formulaName: 'TIERED_WEIGHTS',
     formulaVersion: FORMULA_VERSION,
     formulaParams: params,
     prizePool: fromMinor(prizePoolMinor),
     payouts,
-    leftover: fromMinor(leftoverMinor < 0n ? 0n : leftoverMinor)
+    leftover: fromMinor(leftoverMinor < 0n ? 0n : leftoverMinor),
+	maxHitsInDraw: input.maxHitsInDraw
   };
 }
 
-// 3) Фиксированная таблица призов (например, гарантии спонсора)
 function fixedTable(input: SettlementInput, params: any): SettlementResult {
-  const fixed: Record<string, number> = params?.fixed ?? {"15":10000,"14":1500,"13":250};
-  let leftoverMinor = 0n;
-  const payouts: Payout[] = [];
-
-  for (const [hitsStr, prize] of Object.entries(fixed)) {
-    const h = +hitsStr;
-    if (h > input.maxHitsInDraw) continue;
-    const group = input.hitsByUser.filter(x => x.hits === h);
-    if (group.length === 0) {
-      leftoverMinor += toMinor(prize);
-      continue;
-    }
-    const perHeadMinor = toMinor(prize) / BigInt(group.length);
-    for (const g of group) {
-      payouts.push({
-        userId: g.userId, wallet: g.wallet, hits: g.hits,
-        amount: fromMinor(perHeadMinor)
-      });
-    }
-    const distributedMinor = perHeadMinor * BigInt(group.length);
-    leftoverMinor += toMinor(prize) - distributedMinor;
+  const fixed: Record<string, number> = params?.fixed ?? {};
+  if (!fixed || typeof fixed !== 'object') {
+    throw new Error('Invalid FIXED_TABLE params');
   }
 
+  const prizePoolMinor = toMinor(input.totalBank);
+  const payouts: Payout[] = [];
+  let distributedMinor = 0n;
+
+  const winnersByLevel: Record<number, Array<{ userId: number; wallet: string }>> = {};
+  for (let hits = 0; hits <= input.maxHitsInDraw; hits++) {
+    winnersByLevel[hits] = input.hitsByUser.filter(u => u.hits === hits);
+  }
+
+  for (const hits of Object.keys(winnersByLevel).map(n => +n)) {
+    const group = winnersByLevel[hits];
+    if (!group?.length) continue;
+    const prize = fixed[hits] ?? 0;
+    if (prize <= 0) continue;
+    const prizeMinor = toMinor(prize);
+    for (const w of group) {
+      payouts.push({ userId: w.userId, wallet: w.wallet, hits, amount: fromMinor(prizeMinor) });
+    }
+    distributedMinor += prizeMinor * BigInt(group.length);
+  }
+
+  const leftoverMinor = prizePoolMinor - distributedMinor;
   return {
     formulaName: 'FIXED_TABLE',
     formulaVersion: FORMULA_VERSION,
     formulaParams: params,
-    prizePool: input.totalBank,
+    prizePool: fromMinor(prizePoolMinor),
     payouts,
-    leftover: fromMinor(leftoverMinor < 0n ? 0n : leftoverMinor)
+    leftover: fromMinor(leftoverMinor < 0n ? 0n : leftoverMinor),
+	maxHitsInDraw: input.maxHitsInDraw
   };
 }
 
-export function calculatePayouts(
-  name: FormulaName,
-  input: SettlementInput,
-  params: any
-): SettlementResult {
-  switch (name) {
-    case 'MAX_HITS_EQUAL_SHARE': return maxHitsEqualShare(input, params);
-    case 'TIERED_WEIGHTS':       return tieredWeights(input, params);
-    case 'FIXED_TABLE':          return fixedTable(input, params);
-    default: throw new Error(`Unknown formula: ${name}`);
-  }
+export function calculatePayouts(formula: FormulaName, input: SettlementInput, params: MaxHitsParams | TieredParams | FixedParams): SettlementResult {
+  if (formula === 'MAX_HITS_EQUAL_SHARE') return maxHitsEqualShare(input, params);
+  if (formula === 'TIERED_WEIGHTS') return tieredWeights(input, params);
+  if (formula === 'FIXED_TABLE') return fixedTable(input, params);
+  throw new Error('Unknown formula: ' + formula);
 }
