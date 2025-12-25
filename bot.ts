@@ -1,120 +1,186 @@
-// bot.ts — тотализатор 15×3 без платёжки: билеты сохраняются в data/store.json
-// Запуск: pm2 start "npx ts-node --compiler-options '{\"module\":\"commonjs\"}' bot.ts" --name tote-bot --cwd /tote-bot
+
+
+// bot.ts — тотализатор 15×3 с Crypto Pay и TON: билеты сохраняются в data/store.json
+// Запуск: pm2 start "npx ts-node bot.ts" --name tote-bot --cwd /tote-bot
 
 import * as dotenv from 'dotenv';
 dotenv.config();
 
 import { Telegraf, Context, Markup } from 'telegraf';
 import type { InlineKeyboardMarkup } from 'telegraf/types';
-// +++ PAYMENTS/TON +++
-import { initTon, checkTonPayment, checkJettonPayment, sendJetton } from './ton.js';
-import { calculatePayouts, type FormulaName } from './settlement.js';
-
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import fetch from 'node-fetch';
+import {
+  initTon,
+  checkTonPayment,
+  checkJettonPayment,
+  sendTon,
+  isTonConfigured,
+} from './ton';
+
+
+import { calculatePayouts, FormulaName, SettlementInput } from './settlement';
+import { v4 as uuidv4 } from 'uuid';
+
+// Глобальные обработчики ошибок
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
 
 // --------------- .env ---------------
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 if (!BOT_TOKEN) {
-  console.error('ERROR: BOT_TOKEN is empty. Put it into .env');
-  process.exit(1);
+    console.error('ERROR: BOT_TOKEN is empty. Put it into .env');
+    process.exit(1);
 }
+
+console.log('DEBUG BOT_TOKEN length =', BOT_TOKEN.length);
+
 const ADMIN_IDS: number[] = (process.env.ADMIN_IDS || '')
-  .split(',')
-  .map(s => Number(s.trim()))
-  .filter(Boolean);
+    .split(',')
+    .map(s => Number(s.trim()))
+    .filter(Boolean);
 
 const EVENTS_COUNT = Number(process.env.EVENTS_COUNT || 15);
 const PAGE_SIZE = 10;           // "Мои билеты": строки на страницу
 const ADMIN_PAGE_SIZE = 15;     // "Админ: билеты": строки на страницу
 const ADMIN_EDIT_PAGE_SIZE = 5; // 👈 событий на страницу в "Редакторе событий"
+const EVENTS_PER_PAGE = 5; // сколько событий показываем на одной странице при выборе исходов
 
-// Базовая ставка (руб) за «одиночный» билет (по одному исходу в каждом событии)
+
 const STAKE_RUB = Number(process.env.STAKE_RUB || 100);
-
-// === TON / PAYOUT ENV ===
-const TON_NETWORK = (process.env.TON_NETWORK || 'testnet').toLowerCase();   // mainnet | testnet
+const STAKE_TON = Number(process.env.STAKE_TON || 0.1);
+const STAKE_USDT = Number(process.env.STAKE_USDT || 0.1);
+const TON_NETWORK = (process.env.TON_NETWORK || 'testnet').toLowerCase();
 const TON_RECEIVE_ADDRESS = process.env.TON_RECEIVE_ADDRESS || '';
 const TON_MIN_CONFIRMATIONS = Number(process.env.TON_MIN_CONFIRMATIONS || 1);
 const CURRENCY = (process.env.CURRENCY || 'TON').toUpperCase() as 'USDT_TON' | 'TON';
-const STAKE_USDT = Number(process.env.STAKE_USDT || 0.1); // цена базового купона (TON при тестах)
+
+
+const PORT = Number(process.env.PORT || 8080);
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'http://localhost:8080';
+const WEBHOOK_SECRET = uuidv4();
 
 const PAYOUT_FORMULA = (process.env.PAYOUT_FORMULA || 'MAX_HITS_EQUAL_SHARE') as FormulaName;
 function __readJSONEnv(name: string, fallback: any) {
-  try { return JSON.parse(process.env[name] || ''); } catch { return fallback; }
+    try { return JSON.parse(process.env[name] || ''); } catch { return fallback; }
 }
 const PAYOUT_PARAMS_MAX_HITS_EQUAL_SHARE = __readJSONEnv('PAYOUT_PARAMS_MAX_HITS_EQUAL_SHARE', { prizePoolPct: 0.90, rolloverIfNoWinners: true });
-const PAYOUT_PARAMS_TIERED_WEIGHTS       = __readJSONEnv('PAYOUT_PARAMS_TIERED_WEIGHTS',       { prizePoolPct: 0.90, weights: { "15": 70, "14": 20, "13": 10 }, minHits: 13, rolloverUnclaimed: true });
-const PAYOUT_PARAMS_FIXED_TABLE          = __readJSONEnv('PAYOUT_PARAMS_FIXED_TABLE',          { fixed: { "15": 10000, "14": 1500, "13": 250 }, rolloverUnclaimed: true });
+const PAYOUT_PARAMS_TIERED_WEIGHTS = __readJSONEnv('PAYOUT_PARAMS_TIERED_WEIGHTS', { prizePoolPct: 0.90, weights: { "15": 70, "14": 20, "13": 10 }, minHits: 13, rolloverUnclaimed: true });
+const PAYOUT_PARAMS_FIXED_TABLE = __readJSONEnv('PAYOUT_PARAMS_FIXED_TABLE', { fixed: { "15": 10000, "14": 1500, "13": 250 }, rolloverUnclaimed: true });
+
+// === Комбинаторика и инвойсы ===
+function countCombinations(selections: number[][]): number {
+    if (!selections || !selections.length) return 0;
+    let prod = 1;
+    for (const s of selections) {
+        const len = (s && s.length) ? s.length : 0;
+        if (len === 0) return 0;
+        prod *= len;
+    }
+    return prod;
+}
+
+function calcStakeRUB(selections: number[][]): number {
+    const combos = countCombinations(selections);
+    return combos * STAKE_RUB;
+}
+
+function calcStakeCrypto(selections: number[][]): number {
+    const combos = countCombinations(selections);
+    return combos * (CURRENCY === 'USDT_TON' ? STAKE_USDT : STAKE_TON);
+}
+
+function genInvoice(userId: number, drawId: number, combos: number): string {
+    const amount = combos * (CURRENCY === 'USDT_TON' ? STAKE_USDT : STAKE_TON);
+    const comment = `tote_${drawId}_${userId}_${Date.now()}_${combos}`;
+    return comment;
+}
 
 // --------------- Типы ---------------
 type DrawStatus = 'setup' | 'open' | 'closed' | 'settled';
 
 interface EventItem {
-  idx: number;
-  title: string;
-  result: number | null; // 0,1,2 или null
-  isVoid: boolean;
-  sourceUrl?: string; // официальный источник результата
+    idx: number;
+    title: string;
+    result: number | null;
+    isVoid: boolean;
+    sourceUrl?: string;
 }
 
 interface Settlement {
-  settledAt: string;
-  totalPlayed: number; // число не-void событий с результатом
-  maxHits: number;     // максимум совпадений
-  bankRUB: number;     // сумма всех ставок
-  bankUSDT?: number;   // сумма банка в USDT/TON валюте выплат
-  formulaName?: string;
-  formulaParams?: any;
-  formulaVersion?: string;
-  winners: { ticketId: string; userId: number; username?: string; hits: number; prizeRUB: number; prizeUSDT?: number }[];
+    settledAt: string;
+    totalPlayed: number;
+    maxHits: number;
+    bankRUB: number;
+    bankUSDT?: number;
+    formulaName?: string;
+    formulaParams?: any;
+    formulaVersion?: string;
+    winners: { ticketId: string; userId: number; username?: string; hits: number; prizeRUB: number; prizeUSDT?: number }[];
 }
 
 interface Draw {
-  id: number;
-  status: DrawStatus;
-  createdAt: string;
-  events: EventItem[];
-  settlement?: Settlement;
+    id: number;
+    status: DrawStatus;
+    createdAt: string;
+    events: EventItem[];
+    settlement?: Settlement;
 }
 
-const OUTCOMES = ['1', 'X', '2'];                  // компактно (для CSV/TXT)
-const OUT_TEXT = ['Победа 1', 'Ничья', 'Победа 2']; // красиво (для UI)
+const OUTCOMES = ['1', 'X', '2'];
+const OUT_TEXT = ['Победа 1', 'Ничья', 'Победа 2'];
 
 interface Ticket {
-  id: string;
-  userId: number;
-  username?: string;
-  selections: number[][];
-  createdAt: string;
+    id: string;
+    userId: number;
+    username?: string;
+    selections: number[][];
+    createdAt: string;
+    paid: boolean;
+    invoiceId?: string;
 }
 
 interface UserData {
-  hasTicketForCurrent: boolean;
-  wallet?: string;
-  username?: string;
+    hasTicketForCurrent: boolean;
+    wallet?: string;
+    username?: string;
 }
 
 interface Store {
-  draw: Draw;
-  tickets: Ticket[];
-  nextTicketSeq: number;
-  users: { [userId: string]: UserData };
-  payments?: {
-    [invoiceId: string]: {
-      userId: number;
-      currency: 'USDT_TON' | 'TON';
-      amount: number;
-      comment: string;
-      paid: boolean;
-      txHash?: string;
-      createdAt: string;
-    }
-  };
+    draw: Draw;
+    tickets: Ticket[];
+    nextTicketSeq: number;
+    users: { [userId: string]: UserData };
+    payments: {
+        [invoiceId: string]: {
+            userId: number;
+            currency: 'USDT_TON' | 'TON';
+            amount: number;
+            comment: string;
+            paid: boolean;
+            txHash?: string;
+            createdAt: string;
+        }
+    };
 }
 
 interface Session {
-  selections: number[][];
+    selections: number[][];
+}
+
+interface CustomContext extends Context {
+    session?: {
+        adminAction?: {
+            type: 'set_title' | 'set_source' | 'set_wallet' | 'add_event';
+            idx?: number;
+        };
+    };
 }
 
 // --------------- FS ---------------
@@ -122,1870 +188,1744 @@ const DATA_DIR = path.join(process.cwd(), 'data');
 const STORE_FILE = path.join(DATA_DIR, 'store.json');
 
 async function ensureDirs() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
+    await fs.mkdir(DATA_DIR, { recursive: true });
+    await fs.mkdir(path.join(DATA_DIR, 'history'), { recursive: true });
 }
 
 async function loadStore(): Promise<Store> {
-  await ensureDirs();
-  try {
-    const raw = await fs.readFile(STORE_FILE, 'utf8');
-    const data = JSON.parse(raw);
-
-    if (!Array.isArray(data.tickets)) data.tickets = [];
-    if (!data.users || typeof data.users !== 'object' || Array.isArray(data.users)) {
-      data.users = {};
+    await ensureDirs();
+    try {
+        const raw = await fs.readFile(STORE_FILE, 'utf8');
+        const data = JSON.parse(raw);
+        if (!Array.isArray(data.tickets)) data.tickets = [];
+        if (!data.users || typeof data.users !== 'object') data.users = {};
+        if (!data.payments || typeof data.payments !== 'object') data.payments = {};
+        if (!data.draw) {
+            data.draw = { id: 1, status: 'setup', createdAt: new Date().toISOString(), events: [] };
+        }
+        if (typeof data.nextTicketSeq !== 'number') {
+            data.nextTicketSeq = 1;
+        }
+        return data as Store;
+    } catch {
+        const initial: Store = {
+            draw: { id: 1, status: 'setup', createdAt: new Date().toISOString(), events: [] },
+            tickets: [],
+            nextTicketSeq: 1,
+            users: {},
+            payments: {}
+        };
+        await fs.writeFile(STORE_FILE, JSON.stringify(initial, null, 2));
+        return initial;
     }
-    if (!data.draw) {
-      data.draw = {
-        id: 1,
-        status: 'setup',
-        createdAt: new Date().toISOString(),
-        events: [],
-      };
-    }
-    if (typeof data.nextTicketSeq !== 'number') {
-      data.nextTicketSeq = 1;
-    }
-    return data as Store;
-  } catch {
-    const initial: Store = {
-      draw: { id: 1, status: 'setup', createdAt: new Date().toISOString(), events: [] },
-      tickets: [],
-      nextTicketSeq: 1,
-      users: {},
-    };
-    await fs.writeFile(STORE_FILE, JSON.stringify(initial, null, 2));
-    return initial;
-  }
 }
 
 async function saveStore(data: Store) {
-  if (!data.users || typeof data.users !== 'object' || Array.isArray(data.users)) {
-    data.users = {};
-  }
-  await fs.writeFile(STORE_FILE, JSON.stringify(data, null, 2));
+    if (!data.users || typeof data.users !== 'object') data.users = {};
+    if (!data.payments || typeof data.payments !== 'object') data.payments = {};
+    await fs.writeFile(STORE_FILE, JSON.stringify(data, null, 2));
 }
 
 // --------------- Бот и состояние ---------------
-const bot = new Telegraf(BOT_TOKEN);
+const bot = new Telegraf<CustomContext>(BOT_TOKEN);
 let st: Store;
-
 const sessions = new Map<number, Session>();
 
-// --------------- Утилиты форматирования/подсчёта ---------------
-function esc(s: string) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const paymentWatchers = new Map<string, NodeJS.Timeout>();
+
+
+type AdminTextActionType = 'set_title' | 'set_source' | 'set_wallet' | 'add_event';
+
+interface AdminTextAction {
+    type: AdminTextActionType;
+    idx?: number;
 }
+
+const adminTextActions = new Map<number, AdminTextAction>();
+
+
+bot.catch((err: any, ctx) => {
+  console.error('Unhandled error while processing', ctx.update);
+
+  const desc =
+    (typeof err === 'object' && (err.description || err.message)) ||
+    String(err);
+
+  if (desc.includes('message is not modified')) {
+    console.warn('Ignored Telegram error: message is not modified');
+    return;
+  }
+
+  console.error('Error details:', err);
+});
+
+
+// Логируем все входящие апдейты (сообщения и нажатия кнопок)
+bot.use(async (ctx, next) => {
+  try {
+    const u = ctx.update as any;
+
+    if (u.message && u.message.text) {
+      console.log(
+        '>>> MESSAGE',
+        u.message.from?.id,
+        u.message.from?.username,
+        '-',
+        u.message.text
+      );
+    } else if (u.callback_query) {
+      console.log(
+        '>>> CALLBACK',
+        u.callback_query.from?.id,
+        u.callback_query.from?.username,
+        '-',
+        u.callback_query.data
+      );
+    }
+  } catch (e) {
+    console.error('Log middleware error:', e);
+  }
+
+  return next();
+});
+
+
+
+// --------------- Утилиты ---------------
+function esc(s: string) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 const fmtMoney = (n: number) => n.toLocaleString('ru-RU');
 
 function playedEventsCount() {
-  const evs = st?.draw?.events || [];
-  return evs.filter(e => e && e.result !== null && !e.isVoid).length;
+    const evs = st?.draw?.events || [];
+    return evs.filter(e => e && e.result !== null && !e.isVoid).length;
 }
 
-function computeHits(t: Ticket): number {
-  if (!st?.draw?.events) return 0;
+function computeHits(store: Store, ticket: Ticket): number {
+  if (!store?.draw?.events) return 0;
   let hits = 0;
-  for (let i = 0; i < st.draw.events.length; i++) {
-    const ev = st.draw.events[i];
+  for (let i = 0; i < store.draw.events.length; i++) {
+    const ev = store.draw.events[i];
     if (!ev || ev.result === null || ev.isVoid) continue;
-    const sel = t.selections[i] || [];
+    const sel = ticket.selections[i] || [];
     if (sel.includes(ev.result)) hits++;
   }
   return hits;
 }
 
-// === Комбинаторика для цены и генерация инвойса ===
-function countCombinations(selections: number[][]): number {
-  if (!selections || !selections.length) return 0;
-  let prod = 1;
-  for (const s of selections) {
-    const len = (s && s.length) ? s.length : 0;
-    if (len === 0) return 0;
-    prod *= len;
-  }
-  return prod;
-}
-
-function genInvoice(userId: number, drawId: number) {
-  const nonce = Math.random().toString(36).slice(2, 8).toUpperCase();
-  const invoiceId = `INV-${drawId}-${userId}-${Date.now()}-${nonce}`;
-  const comment = `TOTE-${drawId}-${userId}-${nonce}`;
-  return { invoiceId, comment };
-}
-
-// === Формула стоимости Toto-15 ===
-
-// --- Оплата и выпуск билета ---
-bot.action('buy', async (ctx) => {
-  st = st || await loadStore();
-  const uid = ctx.from?.id!;
-  if (st.draw.status !== 'open') { await ctx.answerCbQuery('Приём ставок закрыт'); return; }
-  const sess = sessions.get(uid);
-  if (!sess) { await ctx.answerCbQuery('Сначала выберите исходы билета'); return; }
-  const combos = countCombinations(sess.selections);
-  if (combos <= 0) { await ctx.answerCbQuery('Билет пуст — выберите исходы'); return; }
-
-  const amount = (CURRENCY === 'USDT_TON') ? +(STAKE_USDT * combos).toFixed(6) : +(STAKE_USDT * combos).toFixed(6);
-
-  const { invoiceId, comment } = genInvoice(uid, st.draw.id);
-  st.payments = st.payments || {};
-  st.payments[invoiceId] = { userId: uid, currency: CURRENCY, amount, comment, paid: false, createdAt: new Date().toISOString() };
-  await saveStore(st);
-
-  const text = [
-    '<b>Оплата билета</b>',
-    '',
-    `Сумма: <b>${amount} ${CURRENCY === 'USDT_TON' ? 'USDT' : 'TON'}</b>`,
-    `Адрес для перевода: <code>${TON_RECEIVE_ADDRESS}</code>`,
-    `Комментарий к платежу: <code>${comment}</code>`,
-    '',
-    'Скопируйте комментарий без изменений. После перевода нажмите «Проверить оплату».',
-  ].join('\n');
-
-  await ctx.reply(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [ [Markup.button.callback('🔄 Проверить оплату', `pay:check:${invoiceId}`)], [Markup.button.callback('🏠 На главную', 'home')] ] } });
-});
-
-bot.action(/^pay:check:(.+)$/, async (ctx) => {
-  st = st || await loadStore();
-  const invoiceId = ctx.match[1];
-  const rec = st.payments?.[invoiceId];
-  if (!rec) { await ctx.answerCbQuery('Инвойс не найден'); return; }
-  if (rec.paid) { await ctx.answerCbQuery('Уже оплачено'); return; }
-
-  let found = false, txHash = '';
-  if (rec.currency === 'USDT_TON') {
-    const res = await checkJettonPayment({ ownerBaseAddress: TON_RECEIVE_ADDRESS, expectedAmountTokens: rec.amount, comment: rec.comment, minConfirmations: TON_MIN_CONFIRMATIONS });
-    found = (res as any).found; txHash = (res as any).txHash || '';
-  } else {
-    const res = await checkTonPayment({ toAddress: TON_RECEIVE_ADDRESS, expectedAmountTon: rec.amount, comment: rec.comment, minConfirmations: TON_MIN_CONFIRMATIONS });
-    found = (res as any).found; txHash = (res as any).txHash || '';
-  }
-
-  if (!found) { await ctx.answerCbQuery('Платёж пока не найден. Попробуйте позже.'); return; }
-
-  rec.paid = true; rec.txHash = txHash;
-  await saveStore(st);
-
-  const uid = rec.userId;
-  const sess = sessions.get(uid);
-  if (!sess) { await ctx.reply('Оплата прошла, но нет данных билета. Оформите билет заново.'); return; }
-
-  const tId = `T${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
-  const ticket = { id: tId, userId: uid, username: ctx.from?.username, selections: sess.selections.map(a => a.slice()), createdAt: new Date().toISOString() };
-  st.tickets.push(ticket);
-  st.users[uid] = st.users[uid] || { hasTicketForCurrent: false };
-  st.users[uid].hasTicketForCurrent = true;
-  st.draw.settlement = st.draw.settlement || { settledAt: '', totalPlayed: 0, maxHits: 0, bankRUB: 0, winners: [] };
-  st.draw.settlement.bankUSDT = +(st.draw.settlement.bankUSDT || 0) + rec.amount;
-
-  await saveStore(st);
-  await ctx.reply(`✅ Оплата найдена.\nБилет выпущен: ${tId}`, { reply_markup: homeKbInline() });
-});
-function calcStakeRUB(selections: number[][], base = STAKE_RUB): number {
-  const mult = selections.reduce((acc, s) => acc * (s.length || 1), 1);
-  return base * mult;
-}
-function stakeBreakdown(selections: number[][]) {
-  let singles = 0, doubles = 0, triples = 0;
-  for (const s of selections) {
-    const n = s?.length || 0;
-    if (n <= 1) singles++;
-    else if (n === 2) doubles++;
-    else triples++;
-  }
-  const mult = selections.reduce((acc, s) => acc * (s.length || 1), 1);
-  return { singles, doubles, triples, mult };
-}
-function formatStakeLine(selections: number[][]) {
-  const { singles, doubles, triples, mult } = stakeBreakdown(selections);
-  const price = calcStakeRUB(selections);
-  return `💰 <b>Текущая ставка: ${fmtMoney(price)} ₽</b>\n(множитель ×${mult} • 1×${singles}, 2×${doubles}, 3×${triples})`;
-}
-
-// === Settlement (один проход) ===
-function isReadyForSettlement(draw: Draw): { ready: boolean; totalPlayed: number } {
-  const evs = draw.events || [];
-  if (!evs.length) return { ready: false, totalPlayed: 0 };
-  let totalPlayed = 0;
-  for (const e of evs) {
-    if (e.isVoid) continue;
-    if (e.result === null) return { ready: false, totalPlayed: 0 };
-    totalPlayed++;
-  }
-  return { ready: totalPlayed > 0, totalPlayed };
-}
-
-function settleDraw(): Settlement {
-  const { totalPlayed } = isReadyForSettlement(st.draw);
-  const tickets = st.tickets.slice();
-
-  const bank = tickets.reduce((sum, t) => sum + calcStakeRUB(t.selections), 0);
-
-  let maxHits = 0;
-  const scored = tickets.map(t => {
-    const h = computeHits(t);
-    if (h > maxHits) maxHits = h;
-    return { t, hits: h };
-  });
-
-  const winnersRaw = scored.filter(x => x.hits === maxHits);
-  const winnersCount = winnersRaw.length || 0;
-
-  let prizePerWinner = 0;
-  if (winnersCount > 0) {
-    prizePerWinner = Math.floor(bank / winnersCount);
-  }
-
-  const winners = winnersRaw.map(x => ({
-    ticketId: x.t.id,
-    userId: x.t.userId,
-    username: x.t.username,
-    hits: x.hits,
-    prizeRUB: prizePerWinner,
-  }));
-
-  const settlement: Settlement = {
-    settledAt: new Date().toISOString(),
-    totalPlayed,
-    maxHits,
-    bankRUB: bank,
-    winners,
-  };
-
-  st.draw.settlement = settlement;
-  st.draw.status = 'settled';
-  return settlement;
-}
-
-function formatSettlementSummaryHTML(s: Settlement): string {
-  const lines: string[] = [];
-  lines.push(`🏁 <b>Итоги тиража</b>`);
-  lines.push(`Сыгравших событий: <b>${s.totalPlayed}</b>`);
-  lines.push(`Максимум совпадений: <b>${s.maxHits}</b>`);
-  lines.push(`💰 Банк: <b>${fmtMoney(s.bankRUB)} ₽</b>`);
-  lines.push(`Победителей: <b>${s.winners.length}</b>`);
-  if (s.winners.length) {
-    const sample = s.winners.slice(0, 10).map((w, i) => {
-      const tag = w.username ? `@${esc(w.username)}` : `u:${w.userId}`;
-      return `${i + 1}) ${tag} • #${esc(w.ticketId.slice(0, 8))}… • ${w.hits} совп. • приз ${fmtMoney(w.prizeRUB)} ₽`;
-    });
-    lines.push('');
-    lines.push(sample.join('\n'));
-    if (s.winners.length > 10) lines.push(`… и ещё ${s.winners.length - 10}`);
-  }
-  return lines.join('\n');
-}
-
-// Общий HTML-свод результатов (для превью/рассылки/кнопки игрока)
-function getResultsSummaryHTML(): string {
-  const d = st.draw;
-  const lines: string[] = [];
-
-  lines.push(`🏆 <b>Результаты тиража #${d.id}</b>`);
-  lines.push('');
-
-  (d.events || []).forEach((e, i) => {
-    const n = String(i + 1).padStart(2, '0');
-    const title = esc(e.title || `Событие ${i + 1}`);
-    let res = '—';
-    if (e.isVoid) res = 'АННУЛИРОВАНО';
-    else if (e.result !== null) res = OUT_TEXT[e.result];
-
-    let src = '';
-    if (e.sourceUrl) {
-      try {
-        const u = new URL(e.sourceUrl);
-        src = `\n   Источник: <a href="${esc(u.toString())}">${esc(u.hostname)}</a>`;
-      } catch {
-        src = `\n   Источник: <a href="${esc(e.sourceUrl)}">${esc(e.sourceUrl)}</a>`;
-      }
-    }
-    lines.push(`${n}. ${title} — <b>${esc(res)}</b>${src}`);
-  });
-
-  const totalPlayed = playedEventsCount();
-  const totalTickets = st.tickets.length;
-  const uniqueUsers = new Set(st.tickets.map(t => t.userId)).size;
-  const bank = st.tickets.reduce((sum, t) => sum + calcStakeRUB(t.selections), 0);
-
-  lines.push('');
-  lines.push(`Сыгравших событий: <b>${totalPlayed}/${st.draw.events.length}</b>`);
-  lines.push(`👥 Билетов: <b>${totalTickets}</b> • 👤 Участников: <b>${uniqueUsers}</b> • 💰 Банк (сумма ставок): <b>${fmtMoney(bank)} ₽</b>`);
-
-  if (d.settlement) {
-    lines.push('');
-    lines.push(formatSettlementSummaryHTML(d.settlement));
-  }
-
-  return lines.join('\n');
-}
-
-// Топ игроков по лучшему билету (черновой рейтинг, если нет settlement)
-function getLeadersTable(limit = 10): { html: string; leaders: { userId: number; username?: string; hits: number }[] } {
-  const bucket: Record<string, { userId: number; username?: string; hits: number }> = {};
-  for (const t of st.tickets) {
-    const key = String(t.userId);
-    const h = computeHits(t);
-    if (!bucket[key] || h > bucket[key].hits) {
-      bucket[key] = { userId: t.userId, username: t.username, hits: h };
-    }
-  }
-  const leaders = Object.values(bucket).sort((a, b) => b.hits - a.hits).slice(0, limit);
-
-  const lines: string[] = [];
-  if (!leaders.length) {
-    lines.push('Пока нет билетов.');
-  } else {
-    lines.push('<b>Топ участников</b>');
-    leaders.forEach((u, idx) => {
-      const tag = u.username ? `@${esc(u.username)}` : `u:${u.userId}`;
-      const medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : '🏅';
-      lines.push(`${medal} ${tag} — <b>${u.hits}</b> совп.`);
-    });
-  }
-  return { html: lines.join('\n'), leaders };
-}
-
-function getIntroHtml(): string {
-  return [
-    `👋 <b>Привет!</b> Ты в тотализаторе <b>15×3</b> — лёгкая игра на спортивные исходы.`,
-    ``,
-    `Как это работает:`,
-    `• На каждый из <b>${EVENTS_COUNT}</b> матчей выбираешь исход: <b>1</b> (победа хозяев), <b>X</b> (ничья) или <b>2</b> (победа гостей).`,
-    `• Можно отмечать сразу несколько исходов на матч — так шанс выше, но билет «шире».`,
-    `• Когда готов — жми «<b>Сохранить</b>». Билет попадёт в базу текущего тиража.`,
-    ``,
-    `💡 Важно: <b>стоимость билета зависит от числа отмеченных исходов</b>.`,
-    `Базовая ставка — <b>${STAKE_RUB} ₽</b>, итоговая цена = база × произведение выбранных вариантов (1/2/3) по всем событиям.`,
-    ``,
-    `Что здесь удобно:`,
-    `• <b>🎲 Автовыбор</b> — бот сам раскидает случайные исходы по всем событиям.`,
-    `• <b>🧹 Очистить выбор</b> — одним нажатием всё сбрасывается.`,
-    `• <b>📋 Мои билеты</b> — аккуратный список с пагинацией, детальные карточки и экспорт в TXT/CSV.`,
-    `• <b>🏆 Результаты</b> — официальный свод по тиражу с ссылками на источники.`,
-    `• <b>🛠 Админ-меню</b> — для организаторов (редактор событий, результаты, отчёты).`,
-    ``,
-    `Удачи и азарта! 💙`,
-  ].join('\n');
-}
-
-// --------------- Клавиатуры ---------------
-function mainKb(): InlineKeyboardMarkup {
-  return {
-    inline_keyboard: [
-      [Markup.button.callback('🎫 Собрать билет', 'make')],
-      [Markup.button.callback('📋 Мои билеты', 'my')],
-      [Markup.button.callback('🏆 Результаты', 'u:results')],
-    ],
-  };
-}
-
-function homeKbInline(): InlineKeyboardMarkup {
-  return { inline_keyboard: [[Markup.button.callback('🏠 На главную', 'home')]] };
-}
-
-function confirmSaveKb(): InlineKeyboardMarkup {
-  return {
-    inline_keyboard: [
-      [
-        Markup.button.callback('✅ Подтвердить', 'save:ticket:confirm'),
-        Markup.button.callback('❌ Отменить', 'save:ticket:cancel'),
-      ],
-      [Markup.button.callback('🏠 На главную', 'home')],
-    ],
-  };
-}
-
-function makeTicketKb(s: Session, events: EventItem[]): InlineKeyboardMarkup {
-  const rows: any[] = [];
-
-  for (let i = 0; i < EVENTS_COUNT; i++) {
-    const sel = s.selections[i] || [];
-    const title = events[i]?.title || `Событие ${i + 1}`;
-    rows.push([
-      Markup.button.callback(`${String(i + 1).padStart(2, '0')}. ${title}`.slice(0, 64), `noop:make:${i}`)
-    ]);
-    rows.push([
-      Markup.button.callback(sel.includes(0) ? '✅ 1' : '1', `sel:${i}:0`),
-      Markup.button.callback(sel.includes(1) ? '✅ X' : 'X', `sel:${i}:1`),
-      Markup.button.callback(sel.includes(2) ? '✅ 2' : '2', `sel:${i}:2`)
-    ]);
-  }
-
-  rows.push([
-    Markup.button.callback('🎲 Автовыбор', 'auto:pick'),
-    Markup.button.callback('🧹 Очистить выбор', 'clear:pick'),
-    Markup.button.callback('💾 Сохранить', 'save:ticket'),
-  ]);
-  rows.push([Markup.button.callback('🏠 На главную', 'home')]);
-
-  rows.push([Markup.button.callback('💳 Оплатить и выпустить билет', 'buy')]);
-  return { inline_keyboard: rows };
-}
-
-// --------------- Пагинация редактора событий ---------------
-function pageForEventIdx(idx: number) {
-  return Math.floor(idx / ADMIN_EDIT_PAGE_SIZE) + 1;
-}
-
-// --------------- Заглушка событий для setup ---------------
-const placeholderEvents = Array.from({ length: EVENTS_COUNT }, (_, i) => ({
-  idx: i,
-  title: `Матч ${i + 1}: КомандаA — КомандаB`,
-  result: null,
-  isVoid: false,
-}));
-
-// --------------- Команды /start /help /rules /events /my ---------------
-bot.start(async (ctx) => {
-  st = st || await loadStore();
-  await ctx.reply(getIntroHtml(), { parse_mode: 'HTML', reply_markup: mainKb() });
-});
-
-// HELP без <hr>
-bot.help(async (ctx) => {
-  const helpText = `
-<b>🎯 Добро пожаловать в тотализатор!</b>
-
-Этот бот — простая игра на прогноз исходов матчей ⚽️🏒🏀  
-Вы выбираете результаты — бот фиксирует ваш билет и ждёт окончания тиража.  
-После завершения всех событий бот подведёт итоги и покажет победителей 💪
-
-— — — — — — — — — —
-
-<b>📘 Как играть:</b>
-
-1️⃣ Нажмите <i>«Собрать билет»</i><br>
-2️⃣ В каждом событии выберите исход:<br>
-&nbsp;&nbsp;&nbsp;🅰 Победа первой команды<br>
-&nbsp;&nbsp;&nbsp;🤝 Ничья<br>
-&nbsp;&nbsp;&nbsp;🅱 Победа второй команды<br>
-3️⃣ Не хотите вручную? Жмите 🎲 <i>«Автовыбор»</i> — бот расставит исходы сам.<br>
-4️⃣ Можно стереть выбор кнопкой 🧹 <i>«Очистить выбор»</i>.<br>
-5️⃣ Нажмите <i>«💾 Сохранить»</i> — появится подтверждение ставки и кнопка «Подтвердить».
-
-— — — — — — — — — —
-
-<b>💰 Ставка:</b><br>
-• Базовая ставка — <b>${STAKE_RUB} ₽</b>.<br>
-• Итоговая стоимость = база × произведение отмеченных исходов (1/2/3) по всем событиям.<br>
-• Чем больше вариантов отмечаете, тем выше шансы — и тем дороже билет.
-
-— — — — — — — — — —
-
-<b>📋 Что ещё умеет бот:</b><br>
-🎟 <i>«Мои билеты»</i> — список ваших билетов с навигацией и экспортом TXT/CSV.<br>
-🏆 <i>«Результаты»</i> — официальный свод по тиражу с исходами и источниками.<br>
-
-<b>🎉 Удачи и спортивного азарта!</b>
-  `;
-  await ctx.reply(helpText, { parse_mode: 'HTML', reply_markup: homeKbInline() });
-});
-
-// RULES
-bot.command('rules', async (ctx) => {
-
-// --- /wallet: сохранить адрес для выплат ---
-bot.command('wallet', async (ctx) => {
-  st = st || await loadStore();
-  const uid = ctx.from?.id!;
-  const parts = (ctx.message as any).text.split(/\s+/);
-  if (parts.length < 2) {
-    await ctx.reply('Пришлите адрес: /wallet EQC...ваш_адрес', { reply_markup: homeKbInline() });
-    return;
-  }
-  const addr = parts[1].trim();
-  st.users[uid] = st.users[uid] || { hasTicketForCurrent: false };
-  st.users[uid].wallet = addr;
-  st.users[uid].username = st.users[uid].username || ctx.from?.username || '';
-  await saveStore(st);
-  await ctx.reply(`Адрес сохранён: ${addr}`, { reply_markup: homeKbInline() });
-});
-  const text = `
-<b>📜 Правила</b>
-
-• Тираж состоит из ${EVENTS_COUNT} событий.<br>
-• В каждом событии можно выбрать один или несколько исходов: <b>1</b> / <b>X</b> / <b>2</b>.<br>
-• Итоговая ставка = <b>${STAKE_RUB} ₽ × произведение числа отмеченных исходов</b> по всем событиям.<br>
-• Когда все события завершатся, бот подведёт итоги по совпадениям (void не учитываются).<br>
-• Итоги подтверждаются ссылками на официальные источники (если указаны админом).
-  `;
-  await ctx.reply(text, { parse_mode: 'HTML', reply_markup: homeKbInline() });
-});
-
-// Список событий (публичный)
-bot.command('events', async (ctx) => {
-  st = st || await loadStore();
-
-  if (!st.draw || !st.draw.events?.length) {
-    await ctx.reply('Список событий пуст. Создайте события в /admin.', { reply_markup: homeKbInline() });
-    return;
-  }
-
-  const lines = st.draw.events.map((e, i) => {
-    const mark = e.isVoid ? '❌' : (e.result === null ? '⚪️' : '✅');
-    const res = e.result === null ? '' : ` — результат: <b>${OUT_TEXT[e.result]}</b>`;
-    let src = '';
-    if (e.sourceUrl) {
-      try {
-        const u = new URL(e.sourceUrl);
-        src = `\n   Источник: <a href="${esc(u.toString())}">${esc(u.hostname)}</a>`;
-      } catch {
-        src = `\n   Источник: <a href="${esc(e.sourceUrl)}">${esc(e.sourceUrl)}</a>`;
-      }
-    }
-    return `${mark} ${String(i + 1).padStart(2, '0')}. ${esc(e.title)}${res}${src}`;
-  });
-
-  await ctx.reply(
-    [
-      `📋 <b>Список событий тиража #${st.draw.id}</b>`,
-      `Статус: ${st.draw.status}`,
-      '',
-      lines.join('\n\n'),
-    ].join('\n'),
-    { parse_mode: 'HTML', reply_markup: homeKbInline() }
-  );
-});
-
-// Мои билеты (команда и кнопка)
-bot.command('my', async (ctx) => {
-  await showMyTicketsPage(ctx, 1);
-});
-bot.action('my', async (ctx) => {
-  await ctx.answerCbQuery('');
-  await showMyTicketsPage(ctx, 1);
-});
-
-// Игрок: кнопка результатов
-bot.action('u:results', async (ctx) => {
-  st = st || await loadStore();
-  const totalPlayed = playedEventsCount();
-  if (totalPlayed === 0) {
-    await ctx.answerCbQuery('');
-    await ctx.reply('Итоги пока недоступны — ещё нет сыгравших событий.', { reply_markup: homeKbInline() });
-    return;
-  }
-  const summary = getResultsSummaryHTML();
-  await ctx.answerCbQuery('');
-  await ctx.reply(summary, { parse_mode: 'HTML', reply_markup: homeKbInline() });
-});
-
-// Домой
-async function goHome(ctx: Context) {
-  const intro = getIntroHtml();
-  try {
-    // @ts-ignore
-    if (ctx.callbackQuery) {
-      await (ctx as any).editMessageText(intro, { parse_mode: 'HTML', reply_markup: mainKb() });
-      return;
-    }
-  } catch {}
-  await (ctx as any).reply(intro, { parse_mode: 'HTML', reply_markup: mainKb() });
-}
-bot.action('home', async (ctx) => {
-  await ctx.answerCbQuery('');
-  await goHome(ctx);
-});
-
-// --------------- Админка ---------------
-function isAdmin(ctx: Context) {
-  const uid = ctx.from?.id;
-  return !!uid && ADMIN_IDS.includes(uid);
-}
-
-bot.command('admin', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  adminState.set(ctx.from!.id, { mode: 'IDLE' });
-  await ctx.reply(
-    `Админ-меню. Тираж #${st.draw.id}, статус: ${st.draw.status}. Событий: ${st.draw.events.length}/${EVENTS_COUNT}`,
-    { reply_markup: adminKb(st.draw) }
-  );
-});
-
-type AdminMode = 'IDLE' | 'RENAME' | 'RENAME_ONE' | 'SET_SRC';
-const adminState = new Map<number, { mode: AdminMode; evIdx?: number }>();
-
-function adminKb(draw: Draw): InlineKeyboardMarkup {
-  const rows = [
-    [Markup.button.callback('🛠 Редактор событий', 'a:manage')],
-    [Markup.button.callback('📋 События', 'a:events')],
-    [
-      Markup.button.callback('🟢 Открыть приём', 'a:open'),
-      Markup.button.callback('🔴 Закрыть приём', 'a:close'),
-    ],
-    [Markup.button.callback('📊 Подвести итоги', 'a:settle')],
-    [Markup.button.callback('📜 Показать список билетов', 'a:list')],
-    [Markup.button.callback('🎟 Билеты (админ)', 'a:tickets')],
-    [Markup.button.callback('👀 Превью итогов', 'a:preview')],
-    [Markup.button.callback('📣 Разослать результаты', 'a:broadcast')],
-    [Markup.button.callback('🏠 На главную', 'home')],
-  ];
-  return { inline_keyboard: rows };
-}
-
-// Пагинация редактора событий
-function manageKb(draw: Draw, page = 1): InlineKeyboardMarkup {
-  const rows: any[] = [];
-
-  const total = draw.events.length;
-  const pages = Math.max(1, Math.ceil(total / ADMIN_EDIT_PAGE_SIZE));
-  const safePage = Math.min(Math.max(1, page), pages);
-  const start = (safePage - 1) * ADMIN_EDIT_PAGE_SIZE;
-  const end = Math.min(start + ADMIN_EDIT_PAGE_SIZE, total);
-
-  for (let i = start; i < end; i++) {
-    const e = draw.events[i];
-    const num = String(e.idx + 1).padStart(2, '0');
-    const res = e.isVoid ? '❌' : (e.result === null ? '—' : OUT_TEXT[e.result]);
-    rows.push([
-      Markup.button.callback(`✏️ ${num}`, `ev:rn:${e.idx}`),
-      Markup.button.callback(`🔗 ${num}`, `ev:src:${e.idx}`),
-      Markup.button.callback(`🗑 ${num}`, `ev:del:${e.idx}`),
-      Markup.button.callback(`${num} ${res}`.slice(0, 12), `noop:ev:${e.idx}`),
-      Markup.button.callback(`${e.title.substring(0, 24)}`, `noop:ev:${e.idx}`),
-    ]);
-    rows.push([
-      Markup.button.callback('1', `ev:set:${e.idx}:0`),
-      Markup.button.callback('X', `ev:set:${e.idx}:1`),
-      Markup.button.callback('2', `ev:set:${e.idx}:2`),
-      Markup.button.callback('❌ Void', `ev:void:${e.idx}`),
-      Markup.button.callback('♻️ Сброс', `ev:clear:${e.idx}`),
-    ]);
-  }
-
-  rows.push([Markup.button.callback('➕ Добавить событие', 'a:add')]);
-
-  // Навигация по страницам
-  const pagesCount = Math.max(1, Math.ceil(total / ADMIN_EDIT_PAGE_SIZE));
-  const nav: any[] = [];
-  if (safePage > 1) nav.push(Markup.button.callback('⬅️ Пред.', `a:pg:${safePage - 1}`));
-  if (safePage < pagesCount) nav.push(Markup.button.callback('➡️ След.', `a:pg:${safePage + 1}`));
-  if (nav.length) rows.push(nav);
-
-  rows.push([Markup.button.callback('🔒 Закрыть приём', 'admin:close'), Markup.button.callback('🧮 Рассчитать банк', 'admin:settle'), Markup.button.callback('💸 Выплатить призы', 'admin:pay')]);
-  rows.push([Markup.button.callback('⬅️ Назад', 'a:back')]);
-  rows.push([Markup.button.callback('🏠 На главную', 'home')]);
-
-  return { inline_keyboard: rows };
-}
-
-bot.action('a:manage', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  await ctx.editMessageText(
-    `Редактор событий. Сейчас: ${st.draw.events.length}/${EVENTS_COUNT}. Выберите строку или установите результаты:`,
-    { reply_markup: manageKb(st.draw, 1) }
-  );
-});
-
-// Переход страниц редактора
-bot.action(/^a:pg:(\d+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const page = Number(ctx.match[1]);
-  st = st || await loadStore();
-  await ctx.answerCbQuery('');
-  try {
-    await ctx.editMessageReplyMarkup(manageKb(st.draw, page));
-  } catch {
-    await ctx.editMessageText(
-      `Редактор событий. Сейчас: ${st.draw.events.length}/${EVENTS_COUNT}. Выберите строку или установите результаты:`,
-      { reply_markup: manageKb(st.draw, page) }
-    );
-  }
-});
-
-// Просмотр событий (админ)
-
-// --- Админ: закрыть приём ---
-bot.action('admin:close', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  st.draw.status = 'closed';
-  await saveStore(st);
-  await ctx.answerCbQuery('Приём закрыт');
-  await ctx.editMessageReplyMarkup({ inline_keyboard: manageKb(st.draw, 1).inline_keyboard });
-});
-
-// --- Админ: расчёт банка и призов ---
-bot.action('admin:settle', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  const hitsByUser = st.tickets.map(t => ({ userId: t.userId, wallet: st.users[t.userId]?.wallet || '', hits: computeHits(t) }));
-  const maxHits = hitsByUser.reduce((m, x) => Math.max(m, x.hits), 0);
-  const totalBank = +(st.draw.settlement?.bankUSDT || 0);
-  const name = (PAYOUT_FORMULA as FormulaName);
-  const params = name === 'MAX_HITS_EQUAL_SHARE' ? PAYOUT_PARAMS_MAX_HITS_EQUAL_SHARE : name === 'TIERED_WEIGHTS' ? PAYOUT_PARAMS_TIERED_WEIGHTS : PAYOUT_PARAMS_FIXED_TABLE;
-  const result = calculatePayouts(name, { drawId: String(st.draw.id), totalBank, maxHitsInDraw: maxHits, hitsByUser }, params);
-  st.draw.settlement = st.draw.settlement || { settledAt: '', totalPlayed: 0, maxHits: 0, bankRUB: 0, winners: [] };
-  st.draw.settlement.maxHits = maxHits;
-  st.draw.settlement.formulaName = result.formulaName;
-  st.draw.settlement.formulaParams = result.formulaParams;
-  st.draw.settlement.formulaVersion = result.formulaVersion;
-  st.draw.settlement.bankUSDT = totalBank;
-  st.draw.settlement.winners = result.payouts.map(p => ({ ticketId: '—', userId: p.userId, username: st.users[p.userId]?.username, hits: p.hits, prizeUSDT: p.amount, prizeRUB: 0 }));
-  await saveStore(st);
-  await ctx.answerCbQuery('Банк рассчитан');
-});
-
-// --- Админ: массовые выплаты ---
-bot.action('admin:pay', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  const s = st.draw.settlement;
-  if (!s || !s.winners?.length) { await ctx.answerCbQuery('Нет списка победителей'); return; }
-  let ok = 0, fail = 0;
-  for (const w of s.winners) {
-    const amount = +(w.prizeUSDT || 0);
-    if (amount <= 0) continue;
-    const wallet = st.users[w.userId]?.wallet;
-    if (!wallet) { fail++; continue; }
+// Функция для безопасного редактирования сообщения
+async function safeEditMessage(ctx: any, text: string, markup?: any) {
     try {
-      const res = await sendJetton({ toAddress: wallet, amountTokens: amount, comment: `Prize #${st.draw.id}`, forwardTon: 0.05 });
-      if ((res as any).ok) ok++; else fail++;
-    } catch { fail++; }
-  }
-  await ctx.answerCbQuery(`Выплаты завершены. Успехов: ${ok}, ошибок: ${fail}`);
-});
-bot.action('a:events', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-
-  const lines = (st.draw.events || []).map((e, i) => {
-    const num = String(i + 1).padStart(2, '0');
-    const title = esc(e.title || `Событие ${i + 1}`);
-    const res = e.isVoid ? '<i>АННУЛИРОВАНО</i>' : (e.result === null ? '—' : `<b>${OUT_TEXT[e.result]}</b>`);
-    const src = e.sourceUrl
-      ? (() => {
-          try {
-            const u = new URL(e.sourceUrl);
-            return `\n   Источник: <a href="${esc(u.toString())}">${esc(u.hostname)}</a>`;
-          } catch {
-            return `\n   Источник: <a href="${esc(e.sourceUrl)}">${esc(e.sourceUrl)}</a>`;
-          }
-        })()
-      : '';
-    return `${num}. ${title} — ${res}${src}`;
-  });
-
-  const text = [
-    `📋 <b>События тиража #${st.draw.id}</b>`,
-    `Статус: <b>${st.draw.status}</b>`,
-    '',
-    lines.length ? lines.join('\n\n') : 'Пока пусто. Нажмите «➕ Добавить событие».',
-  ].join('\n');
-
-  await ctx.answerCbQuery('');
-  try {
-    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: adminKb(st.draw) });
-  } catch {
-    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: adminKb(st.draw) });
-  }
-});
-
-// Возврат в админ-меню
-bot.action('a:back', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  await ctx.answerCbQuery('');
-  const text = `Админ-меню. Тираж #${st.draw.id}, статус: ${st.draw.status}. Событий: ${st.draw.events.length}/${EVENTS_COUNT}`;
-  try {
-    await ctx.editMessageText(text, { reply_markup: adminKb(st.draw) });
-  } catch {
-    await ctx.reply(text, { reply_markup: adminKb(st.draw) });
-  }
-});
-
-bot.action(/^noop:(make|ev):\d+$/, async (ctx) => {
-  await ctx.answerCbQuery('Выберите действие: 1/X/2, Void, ♻️ или ✏️/🔗/🗑');
-});
-
-// Добавить событие (перейти на страницу нового события)
-bot.action('a:add', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  const newIdx = st.draw.events.length;
-  if (newIdx >= EVENTS_COUNT) {
-    await ctx.answerCbQuery('Достигнут лимит событий');
-    return;
-  }
-  st.draw.events.push({ idx: newIdx, title: `Матч ${newIdx + 1}: КомандаA — КомандаB`, result: null, isVoid: false });
-  await saveStore(st);
-  await ctx.answerCbQuery('Событие добавлено');
-  const page = pageForEventIdx(newIdx);
-  try {
-    await ctx.editMessageText(
-      `Редактор событий. Сейчас: ${st.draw.events.length}/${EVENTS_COUNT}. Выберите строку или установите результаты:`,
-      { reply_markup: manageKb(st.draw, page) }
-    );
-  } catch {
-    await ctx.reply(`Добавлено событие #${newIdx + 1}.`, { reply_markup: manageKb(st.draw, page) });
-  }
-});
-
-// Переименование — кнопка
-bot.action(/^ev:rn:(\d+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const idx = Number(ctx.match[1]);
-  st = st || await loadStore();
-  if (!st.draw.events[idx]) {
-    await ctx.answerCbQuery('Нет такого события');
-    return;
-  }
-  adminState.set(ctx.from!.id, { mode: 'RENAME_ONE', evIdx: idx });
-  await ctx.answerCbQuery('');
-  await ctx.reply(`Введите новое имя для события #${idx + 1} (текущее: "${st.draw.events[idx].title}")`, { reply_markup: homeKbInline() });
-});
-
-// Источник — кнопка
-bot.action(/^ev:src:(\d+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const idx = Number(ctx.match[1]);
-  st = st || await loadStore();
-  if (!st.draw.events[idx]) {
-    await ctx.answerCbQuery('Нет такого события');
-    return;
-  }
-  adminState.set(ctx.from!.id, { mode: 'SET_SRC', evIdx: idx });
-  const cur = st.draw.events[idx].sourceUrl;
-  await ctx.answerCbQuery('');
-  await ctx.reply(
-    [
-      `Пришлите ссылку на официальный источник результата для события #${idx + 1}.`,
-      cur ? `Текущее значение: ${cur}` : 'Сейчас не задано.',
-      '',
-      'Отправьте «-» чтобы очистить ссылку.'
-    ].join('\n'),
-    { reply_markup: homeKbInline() }
-  );
-});
-
-// Удалить событие (вернуться на страницу, где оно было)
-bot.action(/^ev:del:(\d+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const idx = Number(ctx.match[1]);
-  st = st || await loadStore();
-  if (!st.draw.events[idx]) {
-    await ctx.answerCbQuery('Нет такого события');
-    return;
-  }
-  const removed = st.draw.events.splice(idx, 1)[0];
-  st.draw.events = st.draw.events.map((e, i) => ({ ...e, idx: i }));
-  await saveStore(st);
-  await ctx.answerCbQuery(`Удалено: ${removed.title}`);
-  const page = pageForEventIdx(Math.max(0, Math.min(idx, st.draw.events.length - 1)));
-  try {
-    await ctx.editMessageText(
-      `Редактор событий. Сейчас: ${st.draw.events.length}/${EVENTS_COUNT}. Выберите строку или установите результаты:`,
-      { reply_markup: manageKb(st.draw, page) }
-    );
-  } catch {
-    await ctx.reply(`Удалено событие #${idx + 1}. Сейчас: ${st.draw.events.length}/${EVENTS_COUNT}.`, { reply_markup: manageKb(st.draw, page) });
-  }
-});
-
-// === Установка результатов (1/X/2), Void и Сброс — с возвратом на «ту» страницу ===
-bot.action(/^ev:set:(\d+):(0|1|2)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const idx = Number(ctx.match[1]);
-  const r = Number(ctx.match[2]) as 0|1|2;
-  st = st || await loadStore();
-  const ev = st.draw.events[idx];
-  if (!ev) { await ctx.answerCbQuery('Нет такого события'); return; }
-  ev.isVoid = false;
-  ev.result = r;
-  await saveStore(st);
-  await ctx.answerCbQuery(`Результат #${idx + 1}: ${OUT_TEXT[r]}`);
-  const page = pageForEventIdx(idx);
-  try {
-    await ctx.editMessageReplyMarkup(manageKb(st.draw, page));
-  } catch {
-    await ctx.reply('Обновлено', { reply_markup: manageKb(st.draw, page) });
-  }
-});
-
-bot.action(/^ev:void:(\d+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const idx = Number(ctx.match[1]);
-  st = st || await loadStore();
-  const ev = st.draw.events[idx];
-  if (!ev) { await ctx.answerCbQuery('Нет такого события'); return; }
-  ev.isVoid = true;
-  ev.result = null;
-  await saveStore(st);
-  await ctx.answerCbQuery(`Событие #${idx + 1} аннулировано`);
-  const page = pageForEventIdx(idx);
-  try {
-    await ctx.editMessageReplyMarkup(manageKb(st.draw, page));
-  } catch {
-    await ctx.reply('Обновлено', { reply_markup: manageKb(st.draw, page) });
-  }
-});
-
-bot.action(/^ev:clear:(\d+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  const idx = Number(ctx.match[1]);
-  st = st || await loadStore();
-  const ev = st.draw.events[idx];
-  if (!ev) { await ctx.answerCbQuery('Нет такого события'); return; }
-  ev.isVoid = false;
-  ev.result = null;
-  await saveStore(st);
-  await ctx.answerCbQuery(`Результат #${idx + 1} очищен`);
-  const page = pageForEventIdx(idx);
-  try {
-    await ctx.editMessageReplyMarkup(manageKb(st.draw, page));
-  } catch {
-    await ctx.reply('Обновлено', { reply_markup: manageKb(st.draw, page) });
-  }
-});
-
-// Открыть/закрыть приём
-bot.action('a:open', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  st.draw.status = 'open';
-  if (st.draw.events.length === 0) {
-    st.draw.events = placeholderEvents.map(e => ({ ...e }));
-  }
-  await saveStore(st);
-  await ctx.answerCbQuery('Приём открыт');
-  await ctx.reply(`Приём открыт. Событий: ${st.draw.events.length}/${EVENTS_COUNT}.`, { reply_markup: homeKbInline() });
-});
-
-bot.action('a:close', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  st.draw.status = 'closed';
-  await saveStore(st);
-  await ctx.answerCbQuery('Приём закрыт');
-  await ctx.reply('Приём закрыт.', { reply_markup: homeKbInline() });
-});
-
-// === Подвести итоги (один проход) ===
-bot.action('a:settle', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-
-  const { ready } = isReadyForSettlement(st.draw);
-  if (!ready) {
-    await ctx.answerCbQuery('Ещё не готовы все результаты (исключая void).');
-    return;
-  }
-  const settlement = settleDraw();
-  await saveStore(st);
-
-  const text = [
-    `✅ Тираж #${st.draw.id} подведён.`,
-    '',
-    formatSettlementSummaryHTML(settlement),
-  ].join('\n');
-
-  await ctx.answerCbQuery('Готово');
-  try {
-    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: adminKb(st.draw) });
-  } catch {
-    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: adminKb(st.draw) });
-  }
-});
-
-// Список билетов (простой текст)
-bot.action('a:list', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  const lines = st.tickets.map(t => {
-    const selPretty = t.selections
-      .map((arr, i) => {
-        const human = arr.map(v => OUTCOMES[v]).join('/');
-        return `${String(i + 1).padStart(2, '0')}:${human || '-'}`;
-      })
-      .join(' | ');
-    const price = calcStakeRUB(t.selections);
-    return `#${t.id} | u:${t.userId} | ${selPretty} | 💸 ${fmtMoney(price)} ₽`;
-  });
-  await ctx.answerCbQuery('');
-  await ctx.reply(lines.slice(-50).join('\n') || 'Пусто', { reply_markup: homeKbInline() });
-});
-
-// Превью итогов
-bot.action('a:preview', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-
-  const summary = getResultsSummaryHTML();
-  const add = !st.draw.settlement ? `\n\n<i>Совет:</i> проставьте все результаты (или Void) и нажмите «📊 Подвести итоги».` : '';
-  const text = summary + add;
-
-  await ctx.answerCbQuery('');
-  try {
-    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: adminKb(st.draw) });
-  } catch {
-    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: adminKb(st.draw) });
-  }
-});
-
-// Рассылка итогов
-bot.action('a:broadcast', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-
-  const totalPlayed = playedEventsCount();
-  if (totalPlayed === 0) {
-    await ctx.answerCbQuery('Нет сыгравших событий — рассылать нечего');
-    return;
-  }
-
-  const uniqUsers = Array.from(new Set(st.tickets.map(t => t.userId)));
-  const summary = getResultsSummaryHTML();
-
-  let ok = 0, fail = 0;
-
-  if (st.draw.settlement) {
-    const s = st.draw.settlement;
-    const winnersByUser = new Map<number, { totalPrize: number; maxHits: number }>();
-    for (const w of s.winners) {
-      const prev = winnersByUser.get(w.userId) || { totalPrize: 0, maxHits: 0 };
-      winnersByUser.set(w.userId, { totalPrize: prev.totalPrize + w.prizeRUB, maxHits: Math.max(prev.maxHits, w.hits) });
+        await ctx.editMessageText(text, { 
+            parse_mode: 'HTML', 
+            reply_markup: markup 
+        });
+    } catch (error: any) {
+        if (error.description && error.description.includes('message is not modified')) {
+            // Игнорируем эту ошибку - сообщение уже в нужном состоянии
+            console.log('Ignored "message not modified" error');
+            return;
+        }
+        throw error; // Пробрасываем другие ошибки
     }
-
-    for (const uid of uniqUsers) {
-      try {
-        const rec = winnersByUser.get(uid);
-        const hdr = rec
-          ? `🎉 Вы в числе победителей тиража #${st.draw.id}! Совпадений: <b>${rec.maxHits}</b>. Ваш приз: <b>${fmtMoney(rec.totalPrize)} ₽</b>.`
-          : `👋 Ваш результат по тиражу #${st.draw.id}.`;
-        const text = [hdr, '', summary].join('\n');
-        await ctx.telegram.sendMessage(uid, text, { parse_mode: 'HTML' });
-        ok++;
-      } catch {
-        fail++;
-      }
-    }
-  } else {
-    // черновой вариант (без призов)
-    for (const uid of uniqUsers) {
-      try {
-        const userTickets = st.tickets.filter(t => t.userId === uid);
-        if (!userTickets.length) continue;
-
-        const best = userTickets
-          .map(t => ({ t, hits: computeHits(t) }))
-          .sort((a, b) => b.hits - a.hits)[0];
-
-        const userBlock = [
-          `👋 Ваш результат по тиражу #${st.draw.id}`,
-          `Совпадений: <b>${best.hits}</b> из <b>${totalPlayed}</b>`,
-          ``,
-          summary
-        ].join('\n');
-
-        await ctx.telegram.sendMessage(uid, userBlock, { parse_mode: 'HTML' });
-        ok++;
-      } catch {
-        fail++;
-      }
-    }
-  }
-
-  const report = [
-    `📣 Разослано итогов: <b>${ok}</b> пользователям`,
-    fail ? `Не доставлено: ${fail}` : '',
-  ].filter(Boolean).join('\n');
-
-  await ctx.answerCbQuery('Готово');
-  try {
-    await ctx.editMessageText(report, { parse_mode: 'HTML', reply_markup: adminKb(st.draw) });
-  } catch {
-    await ctx.reply(report, { parse_mode: 'HTML', reply_markup: adminKb(st.draw) });
-  }
-});
-
-// --------------- Обработка текстом (переименование / источник) ---------------
-bot.on('text', async (ctx) => {
-  const uid = ctx.from?.id;
-  if (!uid) return;
-
-  const state = adminState.get(uid);
-  if (!state || state.mode === 'IDLE') return;
-  if (!isAdmin(ctx)) return;
-
-  const text = (ctx.message as any)?.text || '';
-
-  if (state.mode === 'RENAME') {
-    const m = text.match(/^\s*(\d+)\.\s*(.+?)\s*$/);
-    if (!m) {
-      await ctx.reply('Формат: номер. новое имя\nПример: 2. Милан — Интер', { reply_markup: homeKbInline() });
-      return;
-    }
-    const idx = Number(m[1]) - 1;
-    const name = m[2];
-    st = st || await loadStore();
-    const ev = st.draw.events[idx];
-    if (!ev) {
-      await ctx.reply('Нет такого события', { reply_markup: homeKbInline() });
-      return;
-    }
-    ev.title = name;
-    await saveStore(st);
-    adminState.set(uid, { mode: 'IDLE' });
-    await ctx.reply(`Ок. Событие #${idx + 1} переименовано в: ${name}`, { reply_markup: manageKb(st.draw, pageForEventIdx(idx)) });
-  }
-
-  if (state.mode === 'RENAME_ONE') {
-    const idx = state.evIdx!;
-    const name = text.trim();
-    if (!name) {
-      await ctx.reply('Название не может быть пустым. Введите снова.', { reply_markup: homeKbInline() });
-      return;
-    }
-    st = st || await loadStore();
-    const ev = st.draw.events[idx];
-    if (!ev) {
-      await ctx.reply('Нет такого события', { reply_markup: homeKbInline() });
-      adminState.set(uid, { mode: 'IDLE' });
-      return;
-    }
-    ev.title = name;
-    await saveStore(st);
-    adminState.set(uid, { mode: 'IDLE' });
-    await ctx.reply(`Ок. Событие #${idx + 1} переименовано в: ${name}`, { reply_markup: manageKb(st.draw, pageForEventIdx(idx)) });
-  }
-
-  if (state.mode === 'SET_SRC') {
-    const idx = state.evIdx!;
-    let url = text.trim();
-
-    st = st || await loadStore();
-    const ev = st.draw.events[idx];
-    if (!ev) {
-      await ctx.reply('Нет такого события', { reply_markup: homeKbInline() });
-      adminState.set(uid, { mode: 'IDLE' });
-      return;
-    }
-
-    if (url === '-' || url === '—') {
-      delete ev.sourceUrl;
-      await saveStore(st);
-      adminState.set(uid, { mode: 'IDLE' });
-      await ctx.reply(`Источник для #${idx + 1} очищен.`, { reply_markup: manageKb(st.draw, pageForEventIdx(idx)) });
-      return;
-    }
-
-    try {
-      if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
-      const u = new URL(url);
-      ev.sourceUrl = u.toString();
-    } catch {
-      await ctx.reply('Некорректная ссылка. Пришлите корректный URL (http/https) или «-» для очистки.', { reply_markup: homeKbInline() });
-      return;
-    }
-
-    await saveStore(st);
-    adminState.set(uid, { mode: 'IDLE' });
-    await ctx.reply(`Источник для #${idx + 1} установлен: ${ev.sourceUrl}`, { reply_markup: manageKb(st.draw, pageForEventIdx(idx)) });
-  }
-});
-
-// --------------- Пользовательские кнопки: сбор билета ---------------
-bot.action('make', async (ctx) => {
-  st = st || await loadStore();
-  if (st.draw.status === 'setup') {
-    st.draw.events = placeholderEvents.map(e => ({ ...e }));
-    st.draw.status = 'open';
-    await saveStore(st);
-  }
-  if (st.draw.status !== 'open') {
-    await ctx.answerCbQuery('');
-    await ctx.reply('Приём закрыт. Обратитесь позже.', { reply_markup: homeKbInline() });
-    return;
-  }
-  const sess = { selections: Array.from({ length: EVENTS_COUNT }, () => []) };
-  sessions.set(ctx.from!.id, sess);
-
-  const text = [
-    `Отметьте исходы (1/X/2) по каждому событию, затем нажмите «Сохранить».`,
-    '',
-    formatStakeLine(sess.selections),
-  ].join('\n');
-
-  await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: makeTicketKb(sess, st.draw.events) });
-});
-
-// 🎲 Автовыбор
-bot.action('auto:pick', async (ctx) => {
-  st = st || await loadStore();
-  if (st.draw.status !== 'open') {
-    await ctx.answerCbQuery('Приём закрыт');
-    return;
-  }
-  let sess = sessions.get(ctx.from!.id);
-  if (!sess) {
-    sess = { selections: Array.from({ length: EVENTS_COUNT }, () => []) };
-    sessions.set(ctx.from!.id, sess);
-  }
-  for (let i = 0; i < EVENTS_COUNT; i++) {
-    const r = Math.floor(Math.random() * 3); // 0,1,2
-    sess.selections[i] = [r];
-  }
-  await ctx.answerCbQuery('Готово! Случайные исходы расставлены 👌');
-
-  const text = [
-    `Проверьте и при желании поправьте — затем нажмите «Сохранить».`,
-    '',
-    formatStakeLine(sess.selections),
-  ].join('\n');
-
-  await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: makeTicketKb(sess, st.draw.events) });
-});
-
-// 🧹 Очистить выбор
-bot.action('clear:pick', async (ctx) => {
-  st = st || await loadStore();
-  if (st.draw.status !== 'open') {
-    await ctx.answerCbQuery('Приём закрыт');
-    return;
-  }
-  let sess = sessions.get(ctx.from!.id);
-  if (!sess) {
-    sess = { selections: Array.from({ length: EVENTS_COUNT }, () => []) };
-    sessions.set(ctx.from!.id, sess);
-  } else {
-    for (let i = 0; i < EVENTS_COUNT; i++) sess.selections[i] = [];
-  }
-  await ctx.answerCbQuery('Выбор очищен 🧼');
-
-  const text = [
-    `Отметьте исходы (1/X/2) по каждому событию, затем нажмите «Сохранить».`,
-    '',
-    formatStakeLine(sess.selections),
-  ].join('\n');
-
-  await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: makeTicketKb(sess, st.draw.events) });
-});
-
-// === Переключение исходов с живым обновлением стоимости ===
-bot.action(/^sel:(\d+):([012])$/, async (ctx) => {
-  st = st || await loadStore();
-  if (st.draw.status !== 'open') {
-    await ctx.answerCbQuery('Приём закрыт');
-    return;
-  }
-  const i = Number(ctx.match[1]);
-  const v = Number(ctx.match[2]) as 0 | 1 | 2;
-
-  let sess = sessions.get(ctx.from!.id);
-  if (!sess) {
-    sess = { selections: Array.from({ length: EVENTS_COUNT }, () => []) };
-    sessions.set(ctx.from!.id, sess);
-  }
-  const arr = sess.selections[i] || [];
-
-  const idx = arr.indexOf(v);
-  if (idx >= 0) {
-    // снять выбор
-    arr.splice(idx, 1);
-  } else {
-    // добавить выбор
-    if (arr.length < 3) arr.push(v);
-  }
-  // нормализация
-  sess.selections[i] = Array.from(new Set(arr)).sort();
-
-  await ctx.answerCbQuery('');
-
-  const text = [
-    `Отметьте исходы (1/X/2) по каждому событию, затем нажмите «Сохранить».`,
-    '',
-    formatStakeLine(sess.selections),
-  ].join('\n');
-
-  await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: makeTicketKb(sess, st.draw.events) });
-});
-
-// --- Подтверждение цены перед сохранением ---
-bot.action('save:ticket', async (ctx) => {
-  st = st || await loadStore();
-  if (st.draw.status !== 'open') {
-    await ctx.answerCbQuery('Приём закрыт');
-    return;
-  }
-  const sess = sessions.get(ctx.from!.id) || { selections: Array.from({ length: EVENTS_COUNT }, () => []) };
-
-  const price = calcStakeRUB(sess.selections);
-  const { singles, doubles, triples, mult } = stakeBreakdown(sess.selections);
-
-  const text = [
-    `Почти готово!`,
-    ``,
-    `💰 <b>Стоимость билета: ${fmtMoney(price)} ₽</b>`,
-    `(база ${STAKE_RUB} ₽ × множитель ×${mult} • 1×${singles}, 2×${doubles}, 3×${triples})`,
-    ``,
-    `Нажмите «Подтвердить», чтобы зафиксировать билет.`,
-  ].join('\n');
-
-  await ctx.answerCbQuery('');
-  try {
-    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: confirmSaveKb() });
-  } catch {
-    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: confirmSaveKb() });
-  }
-});
-
-bot.action('save:ticket:cancel', async (ctx) => {
-  await ctx.answerCbQuery('Ок, можно скорректировать выбор.');
-  const sess = sessions.get(ctx.from!.id) || { selections: Array.from({ length: EVENTS_COUNT }, () => []) };
-
-  const text = [
-    `Отметьте исходы (1/X/2) по каждому событию, затем нажмите «Сохранить».`,
-    '',
-    formatStakeLine(sess.selections),
-  ].join('\n');
-
-  await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: makeTicketKb(sess, st.draw.events) });
-});
-
-// Фактическое сохранение билета после подтверждения
-bot.action('save:ticket:confirm', async (ctx) => {
-  try {
-    if (!st) st = await loadStore();
-    const uid = ctx.from?.id!;
-    if (st.draw.status !== 'open') {
-      await ctx.answerCbQuery(`Приём ставок закрыт (статус: ${st.draw.status})`);
-      return;
-    }
-    if (st.draw.events.length !== EVENTS_COUNT) {
-      await ctx.answerCbQuery(`Добавлены не все события (${st.draw.events.length}/${EVENTS_COUNT})`);
-      return;
-    }
-    const s = sessions.get(uid);
-    if (!s) {
-      await ctx.answerCbQuery('Сначала отметьте исходы');
-      return;
-    }
-
-    const ticketId = `${uid}-${Date.now()}`;
-    const ticket: Ticket = {
-      id: ticketId,
-      userId: uid,
-      username: ctx.from?.username,
-      selections: s.selections.map(a => [...a]),
-      createdAt: new Date().toISOString(),
-    };
-
-    if (!st.users) st.users = {};
-    st.tickets.push(ticket);
-    st.users[uid.toString()] = { hasTicketForCurrent: true };
-    await saveStore(st);
-
-    const human = ticket.selections
-      .map((arr, i) => {
-        const ev = st.draw?.events?.[i];
-        const title = ev?.title ? ev.title : `Событие ${i + 1}`;
-        const items = arr.length ? arr.map(v => OUT_TEXT[v]).join(' / ') : '—';
-        return `${String(i + 1).padStart(2, '0')}  ${title}: ${items}`;
-      })
-      .join('\n');
-
-    const price = calcStakeRUB(ticket.selections);
-    const { singles, doubles, triples, mult } = stakeBreakdown(ticket.selections);
-
-    await ctx.answerCbQuery('Билет сохранён!');
-    await ctx.reply(
-      [
-        `<b>Билет #${esc(ticket.id)}</b>`,
-        `Пользователь: @${esc(ticket.username || String(uid))}`,
-        '',
-        `<b>Выбранные исходы:</b>`,
-        `<pre>№   Матч: Исход(ы)\n${esc(human)}</pre>`,
-        '',
-        `💸 <b>Стоимость билета: ${fmtMoney(price)} ₽</b>`,
-        `(база ${STAKE_RUB} ₽ × множитель ×${mult} • 1×${singles}, 2×${doubles}, 3×${triples})`,
-        `🎯 Участвует в тираже #${st.draw.id}`,
-      ].join('\n'),
-      { parse_mode: 'HTML', reply_markup: homeKbInline() }
-    );
-  } catch (e) {
-    console.error(`Error in save:ticket:confirm for user ${ctx.from?.id}:`, e);
-    await ctx.answerCbQuery('Ошибка при сохранении билета');
-  }
-});
-
-// --------------- Мои билеты: список/карточка/экспорт ---------------
-function getUserTicketsSorted(uid: number): Ticket[] {
-  const all = st.tickets.filter(t => t.userId === uid);
-  return all.sort((a, b) => {
-    const ta = a.createdAt || '';
-    const tb = b.createdAt || '';
-    if (ta === tb) return b.id.localeCompare(a.id);
-    return tb.localeCompare(ta);
-  });
 }
 
-function pageCount(total: number, size: number) {
-  return Math.max(1, Math.ceil(total / size));
+function isAdmin(ctx: Context): boolean {
+    return ADMIN_IDS.includes(ctx.from?.id || 0);
 }
 
-function formatTicketRowBrief(t: Ticket, indexInPage: number) {
-  const filled = t.selections.reduce((acc, a) => acc + (a && a.length ? 1 : 0), 0);
-  const dt = new Date(t.createdAt);
-  const hh = String(dt.getHours()).padStart(2, '0');
-  const mm = String(dt.getMinutes()).padStart(2, '0');
-  const dd = String(dt.getDate()).padStart(2, '0');
-  const mo = String(dt.getMonth() + 1).padStart(2, '0');
-  const price = fmtMoney(calcStakeRUB(t.selections));
-  return `${indexInPage}) #${t.id.slice(0, 8)}… • ${dd}.${mo} ${hh}:${mm} • заполнено ${filled}/${EVENTS_COUNT} • 💸 ${price} ₽`;
-}
-
-function formatMyListPageText(tickets: Ticket[], page: number) {
-  const total = tickets.length;
-  const totalPages = pageCount(total, PAGE_SIZE);
-  const start = (page - 1) * PAGE_SIZE;
-  const slice = tickets.slice(start, start + PAGE_SIZE);
-
-  const lines = slice.map((t, i) => formatTicketRowBrief(t, i + 1));
-  return [
-    `📋 Мои билеты (стр. ${page}/${totalPages}, всего: ${total})`,
-    '',
-    lines.join('\n') || 'Пусто',
-  ].join('\n');
-}
-
-async function showMyTicketsPage(ctx: Context, page: number) {
-  st = st || await loadStore();
-  const uid = ctx.from!.id;
-  const tickets = getUserTicketsSorted(uid);
-  const totalPages = pageCount(tickets.length, PAGE_SIZE);
-  const safePage = Math.min(Math.max(1, page), totalPages);
-
-  const text = formatMyListPageText(tickets, safePage);
-  const kb = myListKeyboard(tickets, safePage, totalPages);
-
-  try {
-    // @ts-ignore
-    if (ctx.callbackQuery) {
-      await (ctx as any).editMessageText(text, { reply_markup: kb });
-      return;
-    }
-  } catch {}
-  await (ctx as any).reply(text, { reply_markup: kb });
-}
-
-function myListKeyboard(tickets: Ticket[], page: number, totalPages: number): InlineKeyboardMarkup {
-  const rows: any[] = [];
-  const start = (page - 1) * PAGE_SIZE;
-  const slice = tickets.slice(start, start + PAGE_SIZE);
-
-  slice.forEach((t) => {
-    rows.push([Markup.button.callback(`🔍 Открыть`, `t:open:${t.id}:${page}`)]);
-  });
-
-  const navRow: any[] = [];
-  if (page > 1) navRow.push(Markup.button.callback('⬅️ Пред.', `t:page:${page - 1}`));
-  if (page < totalPages) navRow.push(Markup.button.callback('➡️ След.', `t:page:${page + 1}`));
-  if (navRow.length) rows.push(navRow);
-
-  rows.push([
-    Markup.button.callback('⬇️ TXT', 't:exp:txt'),
-    Markup.button.callback('⬇️ CSV', 't:exp:csv'),
-  ]);
-
-  rows.push([Markup.button.callback('🏠 На главную', 'home')]);
-
-  return { inline_keyboard: rows };
-}
-
-function detailKb(tickets: Ticket[], currentId: string, pageFrom: number): InlineKeyboardMarkup {
-  const rows: any[] = [];
-  const idx = tickets.findIndex(x => x.id === currentId);
-  const prev = idx > 0 ? tickets[idx - 1] : null;
-  const next = idx >= 0 && idx < tickets.length - 1 ? tickets[idx + 1] : null;
-
-  const navRow: any[] = [];
-  if (prev) navRow.push(Markup.button.callback('⏮️ Пред. билет', `t:nav:prev:${currentId}:${pageFrom}`));
-  if (next) navRow.push(Markup.button.callback('⏭️ След. билет', `t:nav:next:${currentId}:${pageFrom}`));
-  if (navRow.length) rows.push(navRow);
-
-  rows.push([Markup.button.callback('⬅️ Назад к списку', `t:back:${pageFrom}`)]);
-  rows.push([Markup.button.callback('🏠 На главную', 'home')]);
-  return { inline_keyboard: rows };
-}
-
-function formatTicketDetail(t: Ticket) {
-  const dt = new Date(t.createdAt);
-  const hh = String(dt.getHours()).padStart(2, '0');
-  const mm = String(dt.getMinutes()).padStart(2, '0');
-  const dd = String(dt.getDate()).padStart(2, '0');
-  const mo = String(dt.getMonth() + 1).padStart(2, '0');
-
-  const header = `🎫 Билет #${esc(t.id)} • @${esc(t.username || String(t.userId))} • ${dd}.${mo} ${hh}:${mm}`;
-  const lines = t.selections.map((arr, i) => {
-    const ev = st.draw?.events?.[i];
-    const title = ev?.title ? ev.title : `Событие ${i + 1}`;
-    const items = (arr && arr.length) ? arr.map(v => OUT_TEXT[v]).join(' / ') : '—';
-    return `${String(i + 1).padStart(2, '0')}  ${esc(title)}: ${esc(items)}`;
-  });
-
-  const price = fmtMoney(calcStakeRUB(t.selections));
-
-  return `${esc(header)}\n<pre>№   Матч: Исход(ы)\n${lines.join('\n')}</pre>\n💸 <b>Стоимость билета: ${price} ₽</b>\n🎯 Участвует в тираже #${st.draw.id}`;
-}
-
-bot.action(/^t:open:(.+?):(\d+)$/, async (ctx) => {
-  st = st || await loadStore();
-  const uid = ctx.from!.id;
-  const ticketId = ctx.match[1];
-  const page = Number(ctx.match[2]);
-
-  const tickets = getUserTicketsSorted(uid);
-  const ticket = tickets.find(t => t.id === ticketId);
-  if (!ticket) {
-    await ctx.answerCbQuery('Билет не найден');
-    return;
-  }
-
-  const text = formatTicketDetail(ticket);
-  const kb = detailKb(tickets, ticket.id, page);
-
-  await ctx.editMessageText(text, { reply_markup: kb, parse_mode: 'HTML' });
-});
-
-bot.action(/^t:nav:(prev|next):(.+?):(\d+)$/, async (ctx) => {
-  st = st || await loadStore();
-  const uid = ctx.from!.id;
-  const dir = ctx.match[1];
-  const currentId = ctx.match[2];
-  const page = Number(ctx.match[3]);
-
-  const tickets = getUserTicketsSorted(uid);
-  const idx = tickets.findIndex(t => t.id === currentId);
-  if (idx < 0) {
-    await ctx.answerCbQuery('Билет не найден');
-    return;
-  }
-  const newIdx = dir === 'prev' ? Math.max(0, idx - 1) : Math.min(tickets.length - 1, idx + 1);
-  const ticket = tickets[newIdx];
-
-  const text = formatTicketDetail(ticket);
-  const kb = detailKb(tickets, ticket.id, page);
-  await ctx.editMessageText(text, { reply_markup: kb, parse_mode: 'HTML' });
-});
-
-bot.action(/^t:back:(\d+)$/, async (ctx) => {
-  const page = Number(ctx.match[1]);
-  await showMyTicketsPage(ctx, page);
-});
-
-// Экспорт TXT/CSV для пользователя
-bot.action('t:exp:txt', async (ctx) => {
-  st = st || await loadStore();
-  const uid = ctx.from!.id;
-  const tickets = getUserTicketsSorted(uid);
-
-  if (!tickets.length) {
-    await ctx.answerCbQuery('');
-    await ctx.reply('У вас нет билетов для экспорта.', { reply_markup: homeKbInline() });
-    return;
-  }
-
-  const blocks = tickets.map(t => {
-    const head = `#${t.id} • @${t.username || t.userId} • ${new Date(t.createdAt).toISOString()}`;
-    const body = t.selections
-      .map((arr, i) => `${String(i + 1).padStart(2, '0')}  ${(arr && arr.length) ? arr.map(v => OUTCOMES[v]).join('/') : '-'}`)
-      .join('\n');
-    const price = fmtMoney(calcStakeRUB(t.selections));
-    return `${head}\n${body}\n💸 ${price} ₽`;
-  });
-
-  const content = blocks.join('\n\n');
-  const buf = Buffer.from(content, 'utf8');
-
-  await ctx.answerCbQuery('');
-  await (ctx as any).replyWithDocument({ source: buf, filename: `tickets_${uid}.txt` });
-});
-
-bot.action('t:exp:csv', async (ctx) => {
-  st = st || await loadStore();
-  const uid = ctx.from!.id;
-  const tickets = getUserTicketsSorted(uid);
-
-  if (!tickets.length) {
-    await ctx.answerCbQuery('');
-    await ctx.reply('У вас нет билетов для экспорта.', { reply_markup: homeKbInline() });
-    return;
-  }
-
-  const header = ['ticket_id', 'user_id', 'created_at', ...Array.from({ length: EVENTS_COUNT }, (_, i) => `e${String(i + 1).padStart(2, '0')}`), 'stake_rub'];
-  const rows = tickets.map(t => {
-    const cols = Array.from({ length: EVENTS_COUNT }, (_, i) => {
-      const arr = t.selections[i] || [];
-      return arr.length ? arr.map(v => OUTCOMES[v]).join('/') : '-';
-    });
-    const price = String(calcStakeRUB(t.selections));
-    return [t.id, String(t.userId), new Date(t.createdAt).toISOString(), ...cols, price];
-  });
-
-  const escapeCsv = (s: string) => /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  const csv = [header.map(escapeCsv).join(','), ...rows.map(r => r.map(escapeCsv).join(','))].join('\n');
-  const buf = Buffer.from(csv, 'utf8');
-
-  await ctx.answerCbQuery('');
-  await (ctx as any).replyWithDocument({ source: buf, filename: `tickets_${uid}.csv` });
-});
-
-// --------------- Админ: билеты (пагинация/просмотр/экспорт) ---------------
 function getAllTicketsSorted(): Ticket[] {
-  const all = st.tickets.slice();
-  return all.sort((a, b) => {
-    const ta = a.createdAt || '';
-    const tb = b.createdAt || '';
-    if (ta === tb) return b.id.localeCompare(a.id);
-    return tb.localeCompare(ta);
-  });
+    return st.tickets.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 }
 
-function formatAdminRow(t: Ticket, n: number) {
-  const dt = new Date(t.createdAt);
-  const hh = String(dt.getHours()).padStart(2, '0');
-  const mm = String(dt.getMinutes()).padStart(2, '0');
-  const dd = String(dt.getDate()).padStart(2, '0');
-  const mo = String(dt.getMonth() + 1).padStart(2, '0');
-  const filled = t.selections.reduce((acc, a) => acc + (a && a.length ? 1 : 0), 0);
-  const price = fmtMoney(calcStakeRUB(t.selections));
-  return `${n}) #${t.id.slice(0,8)}… • u:${t.userId} • ${dd}.${mo} ${hh}:${mm} • заполнено ${filled}/${EVENTS_COUNT} • 💸 ${price} ₽`;
-}
+function getAdminStatsSnapshot(st: Store) {
+  const drawIdPrefix = `${st.draw.id}_`;
+  const tickets = st.tickets.filter(t => t.id.startsWith(drawIdPrefix));
 
-function adminTicketsPageText(tickets: Ticket[], page: number) {
   const total = tickets.length;
-  const totalPages = Math.max(1, Math.ceil(total / ADMIN_PAGE_SIZE));
-  const start = (page - 1) * ADMIN_PAGE_SIZE;
-  const slice = tickets.slice(start, start + ADMIN_PAGE_SIZE);
-  const lines = slice.map((t, i) => formatAdminRow(t, i + 1));
+  const paid = tickets.filter(t => t.paid).length;
+  const unpaid = total - paid;
 
   const uniqueUsers = new Set(tickets.map(t => t.userId)).size;
-  const bank = tickets.reduce((sum, t) => sum + calcStakeRUB(t.selections), 0);
 
-  return [
-    `🎟 Билеты (админ) — стр. ${page}/${totalPages}, всего: ${total}`,
-    `👥 Билетов: ${total} • 👤 Участников: ${uniqueUsers} • 💰 Банк: ${fmtMoney(bank)} ₽`,
-    '',
-    lines.join('\n') || 'Пусто',
-  ].join('\n');
+  const bankCrypto = tickets
+    .filter(t => t.paid)
+    .reduce((sum, t) => sum + Number(calcStakeCrypto(t.selections)), 0);
+
+  const bankRub = tickets
+    .filter(t => t.paid)
+    .reduce((sum, t) => sum + Number(calcStakeRUB(t.selections)), 0);
+
+  return { total, paid, unpaid, uniqueUsers, bankCrypto, bankRub };
+}
+
+function adminDashboardText(st: Store): string {
+  const s = getAdminStatsSnapshot(st);
+  return (
+`🔧 <b>Админ-панель</b>
+🎯 Тираж #${st.draw.id} <b>${st.draw.status}</b>
+
+🎫 Билеты: <b>${s.total}</b>
+✅ Оплачено: <b>${s.paid}</b>   ⏳ Ожидают: <b>${s.unpaid}</b>
+👥 Игроков: <b>${s.uniqueUsers}</b>
+
+💰 <b>Банк (по оплаченным)</b>:
+• ${s.bankRub.toFixed(0)} ₽
+• ${s.bankCrypto.toFixed(4)} ${CURRENCY}
+
+ℹ️ Банк считается по билетам со статусом <b>paid=true</b>.`
+  );
+}
+
+
+// --------------- Клавиатуры ---------------
+function mainKb(ctx: Context, draw: Draw): InlineKeyboardMarkup {
+    const rows: any[] = [];
+    if (draw.status === 'open') {
+        rows.push([Markup.button.callback('🎯 Сыграть!', 'play')]);
+    } else if (draw.status === 'settled') {
+        rows.push([Markup.button.callback('🏆 Результаты', 'results')]);
+    }
+    rows.push([Markup.button.callback('📋 События', 'events')]);
+    rows.push([Markup.button.callback('🎫 Мои билеты', 'my')]);
+    if (isAdmin(ctx)) {
+        rows.push([Markup.button.callback('🔧 Админ', 'admin')]);
+    }
+    rows.push([Markup.button.callback('❓ Правила', 'rules')]);
+    return { inline_keyboard: rows };
+}
+
+function adminKb(draw: Draw): InlineKeyboardMarkup {
+  const rows: any[] = [];
+
+  // Действия по статусу тиража
+  if (draw.status === 'setup') {
+    rows.push([Markup.button.callback('🟢 Открыть тираж', 'as:start')]);
+  } else if (draw.status === 'open') {
+    rows.push([Markup.button.callback('🔒 Закрыть приём ставок', 'as:close')]);
+  } else if (draw.status === 'closed') {
+    rows.push([Markup.button.callback('✅ Рассчитать тираж', 'as:settle')]);
+  } else if (draw.status === 'settled') {
+    rows.push([Markup.button.callback('🆕 Новый тираж', 'as:newdraw')]);
+  }
+
+  // Инструменты админа — всегда доступны
+  rows.push([Markup.button.callback('📊 Статистика', 'as:stats')]);
+
+  // Отчёты/экспорт — тоже всегда (раз ты уже сделал handlers)
+  rows.push([
+    Markup.button.callback('📊 Статистика / отчёты', 'at:list'),
+    Markup.button.callback('📤 Экспорт CSV', 'at:exp:csv'),
+  ]);
+  rows.push([Markup.button.callback('📤 Экспорт JSON', 'at:exp:json')]);
+
+  // Редактор событий — всегда доступен
+  rows.push([Markup.button.callback('📝 Редактор событий', 'ae:edit')]);
+
+  // Назад — один раз
+  rows.push([Markup.button.callback('⬅️ Назад', 'home')]);
+
+  return { inline_keyboard: rows };
+}
+
+
+
+function adminEditKb(page: number, events: EventItem[]): InlineKeyboardMarkup {
+    const totalPages = Math.ceil(events.length / ADMIN_EDIT_PAGE_SIZE);
+    const rows: any[] = [];
+    const start = (page - 1) * ADMIN_EDIT_PAGE_SIZE;
+    const pageEvents = events.slice(start, start + ADMIN_EDIT_PAGE_SIZE);
+    for (const ev of pageEvents) {
+        rows.push([
+            Markup.button.callback(`#${ev.idx + 1} ${esc(ev.title)}`, `ae:open:${ev.idx}`),
+            Markup.button.callback('✏️', `ae:set_title:${ev.idx}`),
+            Markup.button.callback('🗑️', `ae:delete:${ev.idx}`)
+        ]);
+    }
+    const nav: any[] = [];
+    if (page > 1) nav.push(Markup.button.callback('⬅️', `ae:page:${page - 1}`));
+    if (page < totalPages) nav.push(Markup.button.callback('➡️', `ae:page:${page + 1}`));
+    if (nav.length) rows.push(nav);
+    rows.push([Markup.button.callback('➕ Добавить событие', 'ae:add')]);
+    rows.push([Markup.button.callback('⬅️ Админ', 'admin')]);
+    return { inline_keyboard: rows };
+}
+
+function getIntroHtml(hasTicket: boolean, drawId: string | number, drawStatus: 'open' | 'settled' | string): string {
+    const statusText =
+        drawStatus === 'open'
+            ? '🟢 тираж открыт, ставки принимаются'
+            : drawStatus === 'settled'
+            ? '✅ тираж завершён, идут расчёты'
+            : 'ℹ️ статус тиража уточняется';
+
+    const ticketLine = hasTicket
+        ? '🎟 <b>У вас уже есть билет</b> в текущем тираже — удача может быть совсем рядом!'
+        : '👇 Нажмите «🎯 Сыграть!» и соберите свой билет — выберите исходы 15 матчей (1 / X / 2) и поборитесь за призы.';
+
+    return (
+        `🎉 <b>Добро пожаловать в тотализатор 15×3!</b>\n\n` +
+        `📌 Формат игры: <b>15 событий</b>, на каждое вы выбираете исход — <b>1 / X / 2</b>.\n` +
+        `Чем больше правильных исходов, тем крупнее потенциальный выигрыш.\n\n` +
+        `🔄 <b>Текущий тираж #${drawId}</b>\n` +
+        `${statusText}.\n\n` +
+        `${ticketLine}\n\n` +
+        `💡 В любой момент вы можете посмотреть:\n` +
+        `• 📋 список событий — через кнопку «События»\n` +
+        `• 🎫 ваши билеты — через «Мои билеты»\n` +
+        `• 📜 правила — через «Правила»\n\n` +
+        `Удачи и приятной игры! 🍀`
+    );
+}
+
+function startAutoCheckTonPayment(params: {
+  invoiceId: string;
+  userId: number;
+  chatId: number;
+  expectedAmountTon: number;
+}) {
+  const { invoiceId, userId, chatId, expectedAmountTon } = params;
+
+  // не запускаем два таймера на один invoice
+  if (paymentWatchers.has(invoiceId)) return;
+
+  let attempts = 0;
+  const maxAttempts = 25;      // ~5 минут при интервале 12 сек
+  const intervalMs = 12_000;
+
+  const timer = setInterval(async () => {
+    attempts++;
+
+    try {
+      st = st || await loadStore();
+
+      const payment = st.payments[invoiceId];
+      if (!payment) {
+        stopWatcher(invoiceId);
+        return;
+      }
+
+      // если уже отмечено как paid — просто останавливаем
+      if (payment.paid) {
+        stopWatcher(invoiceId);
+        return;
+      }
+
+      // ИЩЕМ ТРАНЗАКЦИЮ В TON (testnet/mainnet зависит от ton.ts)
+      const res = await checkTonPayment({
+        toAddress: TON_RECEIVE_ADDRESS,
+        expectedAmountTon: expectedAmountTon,
+        comment: invoiceId,
+        minConfirmations: TON_MIN_CONFIRMATIONS
+      });
+
+      if (res.found) {
+        // отмечаем оплату
+        payment.paid = true;
+        payment.txHash = res.txHash || '';
+
+        const ticket = st.tickets.find(t => t.invoiceId === invoiceId);
+        if (ticket) ticket.paid = true;
+
+        if (st.users[userId]) st.users[userId].hasTicketForCurrent = true;
+
+        await saveStore(st);
+
+        stopWatcher(invoiceId);
+
+        // ВАЖНО: уведомляем отдельным сообщением (не edit), чтобы не ловить ошибки редактирования
+        await bot.telegram.sendMessage(
+  chatId,
+  `✅ Оплата подтверждена! Билет активирован.\n\nИнвойс: ${invoiceId}\nTx: ${payment.txHash || '—'}`,
+  { link_preview_options: { is_disabled: true } }
+);
+
+        return;
+      }
+
+      // таймаут
+      if (attempts >= maxAttempts) {
+        stopWatcher(invoiceId);
+        await bot.telegram.sendMessage(
+  chatId,
+  `⏳ Не вижу оплату по инвойсу:\n${invoiceId}\n\nЕсли вы уже оплатили — нажмите «🔄 Проверить оплату» ещё раз.`,
+  { link_preview_options: { is_disabled: true } }
+);
+
+      }
+    } catch (e) {
+      // ошибки сети/toncenter не валим бот — просто пишем в лог и продолжаем
+      console.error('[AUTO_CHECK] error', e);
+      if (attempts >= maxAttempts) stopWatcher(invoiceId);
+    }
+  }, intervalMs);
+
+  paymentWatchers.set(invoiceId, timer);
+}
+
+function stopWatcher(invoiceId: string) {
+  const t = paymentWatchers.get(invoiceId);
+  if (t) clearInterval(t);
+  paymentWatchers.delete(invoiceId);
+}
+
+
+// --------------- Обработчики команд ---------------
+bot.start(async (ctx) => {
+    st = st || await loadStore();
+    const userId = ctx.from.id;
+    const username = ctx.from.username || '';
+    if (!st.users[userId]) {
+        st.users[userId] = { hasTicketForCurrent: false, username };
+        await saveStore(st);
+    }
+
+    const hasTicket = st.users[userId].hasTicketForCurrent;
+    const text = getIntroHtml(hasTicket, st.draw.id, st.draw.status);
+
+    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: mainKb(ctx, st.draw) });
+});
+
+
+bot.command('help', async (ctx) => {
+    st = st || await loadStore();
+    await ctx.reply('Помощь: используйте /start или кнопки меню.', {
+        reply_markup: mainKb(ctx, st.draw),
+    });
+});
+
+// ---------- Вспомогательные функции ----------
+
+async function handleRules(ctx: CustomContext) {
+    st = st || await loadStore();
+    const text = `📜 Правила тотализатора 15×3\n\n1. Выберите 1-3 исхода (1/X/2) для каждого из 15 событий.\n2. Стоимость билета = ${fmtMoney(
+        STAKE_RUB,
+    )} ₽ × число комбинаций.\n3. После закрытия тиража результаты фиксируются.\n4. Призы распределяются по формуле: ${PAYOUT_FORMULA}.\n5. Максимум совпадений = выигрыш!`;
+    await ctx.reply(text, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[Markup.button.callback('🏠 Главная', 'home')]] },
+    });
+}
+
+async function handleEvents(ctx: CustomContext) {
+    st = st || await loadStore();
+    const evs = st.draw.events;
+    if (!evs.length) {
+        return ctx.reply('События не настроены. Обратитесь к админу.', {
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: [[Markup.button.callback('🏠 Главная', 'home')]] },
+        });
+    }
+    const lines = evs.map(
+        (e, i) =>
+            `${String(i + 1).padStart(2, '0')} ${esc(e.title)}${
+                e.result !== null ? ` → ${OUT_TEXT[e.result]}` : ''
+            }${e.isVoid ? ' (аннулировано)' : ''}${
+                e.sourceUrl ? ` [📎](${e.sourceUrl})` : ''
+            }`,
+    );
+    const text = `📋 События тиража #${st.draw.id}\n\n${lines.join('\n')}`;
+    await ctx.reply(text, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[Markup.button.callback('🏠 Главная', 'home')]] },
+    });
+}
+
+async function handleMyTickets(ctx: CustomContext) {
+    st = st || await loadStore();
+    const userId = ctx.from!.id;
+    const myTickets = st.tickets.filter(
+        (t) => t.userId === userId && t.id.startsWith(`${st.draw.id}_`),
+    );
+    if (!myTickets.length) {
+        return ctx.reply('У вас нет билетов в текущем тираже.', {
+            reply_markup: { inline_keyboard: [[Markup.button.callback('🎯 Сыграть', 'play')]] },
+        });
+    }
+    const page = 1;
+    const text = myTicketsPageText(myTickets, page);
+    const kb = myTicketsKb(myTickets, page);
+    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: kb });
+}
+
+async function handleAdminPanel(ctx: CustomContext) {
+    if (!isAdmin(ctx)) {
+        return ctx.reply('Доступ запрещён.');
+    }
+    st = st || await loadStore();
+    const text = `🔧 Админ-панель: Тираж #${st.draw.id} (${st.draw.status})`;
+    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: adminKb(st.draw) });
+}
+
+// ---------- Привязка и к командам, и к кнопкам ----------
+
+// /rules и кнопка "rules"
+bot.command('rules', async (ctx) => {
+    await handleRules(ctx);
+});
+bot.action('rules', async (ctx) => {
+    await ctx.answerCbQuery();
+    await handleRules(ctx);
+});
+
+// /events и кнопка "events"
+bot.command('events', async (ctx) => {
+    await handleEvents(ctx);
+});
+bot.action('events', async (ctx) => {
+    await ctx.answerCbQuery();
+    await handleEvents(ctx);
+});
+
+// /my и кнопка "my"
+bot.command('my', async (ctx) => {
+    await handleMyTickets(ctx);
+});
+bot.action('my', async (ctx) => {
+    await ctx.answerCbQuery();
+    await handleMyTickets(ctx);
+});
+
+// /admin и кнопка "admin"
+bot.command('admin', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.reply('Доступ запрещён.');
+  st = st || await loadStore();
+  const text = adminDashboardText(st);
+  await ctx.reply(text, {
+    parse_mode: 'HTML',
+    reply_markup: {
+      inline_keyboard: [
+        [Markup.button.callback('🔄 Обновить', 'admin:dash')],
+        [Markup.button.callback('📝 Редактор событий', 'ae:edit')],
+        [Markup.button.callback('⚙️ Действия тиража', 'admin')], // если у тебя adminKb на 'admin'
+        [Markup.button.callback('🏠 Главная', 'home')],
+      ]
+    }
+  });
+});
+
+bot.action('admin:dash', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+  st = st || await loadStore();
+  const text = adminDashboardText(st);
+  await ctx.answerCbQuery('');
+  await safeEditMessage(ctx, text, {
+    inline_keyboard: [
+      [Markup.button.callback('🔄 Обновить', 'admin:dash')],
+      [Markup.button.callback('📝 Редактор событий', 'ae:edit')],
+      [Markup.button.callback('⚙️ Действия тиража', 'admin')],
+      [Markup.button.callback('🏠 Главная', 'home')],
+    ]
+  });
+});
+
+
+bot.action('admin', async (ctx) => {
+    await ctx.answerCbQuery();
+    await handleAdminPanel(ctx);
+});
+
+
+
+// --------------- Действия: Игра ---------------
+
+// Текст для одного исхода
+function getOutcomeText(outcome: number | null): string {
+  if (outcome === 0) return 'Победа 1';
+  if (outcome === 1) return 'Ничья';
+  if (outcome === 2) return 'Победа 2';
+  return 'не выбран';
+}
+
+// Текст для всей сетки: список 01..15 + выбранные исходы
+function buildPlayText(draw: Draw, selections: number[][]): string {
+  const evs = draw.events;
+  const totalEvents = Math.min(EVENTS_COUNT, evs.length);
+
+  const header =
+    `🎯 Выбор исходов для тиража #${draw.id}\n\n` +
+    `Отметьте исходы (1 / X / 2) по каждому событию.\n` +
+    `Можно выбирать один, два или три исхода на матч — как в классическом тотализаторе 15×3.\n\n`;
+
+  const lines: string[] = [];
+  for (let i = 0; i < totalEvents; i++) {
+    const ev = evs[i];
+    const title = esc(ev?.title || `Событие ${i + 1}`);
+
+    const sel = selections[i] || [];
+    let choice: string;
+    if (!sel.length) {
+      choice = 'не выбран';
+    } else {
+      const parts = sel.map(o => getOutcomeText(o));
+      choice = parts.join(' + ');
+    }
+
+    lines.push(
+      `${String(i + 1).padStart(2, '0')}. ${title}\n` +
+      `   Ваш выбор: <b>${choice}</b>`
+    );
+  }
+
+  return header + lines.join('\n\n');
+}
+
+// Клавиатура: для каждого события — строка названия + строка [1][X][2]
+// Внизу — Автовыбор / Очистить / Сформировать / Главная
+function buildPlayKb(s: Session, draw: Draw): InlineKeyboardMarkup {
+  const evs = draw.events;
+  const totalEvents = Math.min(EVENTS_COUNT, evs.length);
+  const rows: any[] = [];
+
+  for (let i = 0; i < totalEvents; i++) {
+    const title = evs[i]?.title || `Событие ${i + 1}`;
+    const sel = s.selections[i] || [];
+
+    // Строка с названием события (кнопка-заглушка)
+    rows.push([
+      Markup.button.callback(
+        `${String(i + 1).padStart(2, '0')}. ${title}`.slice(0, 64),
+        `noop:event:${i}`
+      ),
+    ]);
+
+    // Строка с исходами 1 / X / 2
+    rows.push([
+      Markup.button.callback(
+        sel.includes(0) ? '✅ 1' : '1',
+        `ps:toggle:${i}:0`
+      ),
+      Markup.button.callback(
+        sel.includes(1) ? '✅ X' : 'X',
+        `ps:toggle:${i}:1`
+      ),
+      Markup.button.callback(
+        sel.includes(2) ? '✅ 2' : '2',
+        `ps:toggle:${i}:2`
+      ),
+    ]);
+  }
+
+  // Общие действия
+  rows.push([
+    Markup.button.callback('🎲 Автовыбор', 'play:auto'),
+    Markup.button.callback('🧹 Очистить выбор', 'play:clearAll'),
+  ]);
+
+  rows.push([
+    Markup.button.callback('✅ Сформировать билет', 'confirm_ticket'),
+  ]);
+
+  rows.push([
+    Markup.button.callback('🏠 Главная', 'home'),
+  ]);
+
+  return { inline_keyboard: rows };
+}
+
+// Нажали "🎯 Сыграть!"
+bot.action('play', async (ctx) => {
+  st = st || await loadStore();
+  if (st.draw.status !== 'open') {
+    return ctx.answerCbQuery('Тираж закрыт для ставок.');
+  }
+
+  const userId = ctx.from!.id;
+  if (st.users[userId]?.hasTicketForCurrent) {
+    return ctx.answerCbQuery('У вас уже есть билет в текущем тираже!');
+  }
+
+  const evs = st.draw.events;
+  if (!evs.length) {
+    return ctx.answerCbQuery('События ещё не настроены.');
+  }
+
+  const totalEvents = Math.min(EVENTS_COUNT, evs.length);
+  if (totalEvents === 0) {
+    return ctx.answerCbQuery('События ещё не настроены.');
+  }
+
+  // Инициализируем пустые выборы: по матчу — массив исходов []
+  const selections: number[][] = Array.from({ length: totalEvents }, () => []);
+  const session: Session = { selections };
+  sessions.set(userId, session);
+
+  const text = buildPlayText(st.draw, selections);
+  const kb = buildPlayKb(session, st.draw);
+
+  await ctx.answerCbQuery();
+  await safeEditMessage(ctx, text, kb);
+});
+
+// Тоггл 1 / X / 2 для конкретного события
+// ps:toggle:<eventIdx>:<0|1|2>
+bot.action(/^ps:toggle:(\d+):([012])$/, async (ctx) => {
+  const eventIdx = Number(ctx.match[1]);
+  const outcome = Number(ctx.match[2]); // 0,1,2
+
+  const userId = ctx.from!.id;
+  const session = sessions.get(userId);
+  if (!session) {
+    await ctx.answerCbQuery('Сессия истекла. Нажмите «Сыграть!» ещё раз.');
+    return;
+  }
+
+  st = st || await loadStore();
+  const evs = st.draw.events;
+  const totalEvents = Math.min(EVENTS_COUNT, evs.length);
+
+  if (eventIdx < 0 || eventIdx >= totalEvents) {
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  const sel = session.selections[eventIdx] || [];
+  const idx = sel.indexOf(outcome);
+  if (idx >= 0) {
+    // уже выбран — убираем
+    sel.splice(idx, 1);
+  } else {
+    // не выбран — добавляем
+    sel.push(outcome);
+    sel.sort(); // чтобы порядок был 0,1,2
+  }
+  session.selections[eventIdx] = sel;
+
+  const text = buildPlayText(st.draw, session.selections);
+  const kb = buildPlayKb(session, st.draw);
+
+  await ctx.answerCbQuery('Выбор обновлён ✅');
+  await safeEditMessage(ctx, text, kb);
+});
+
+// Автовыбор — заполняет все пустые события случайным исходом 1/X/2
+bot.action('play:auto', async (ctx) => {
+  const userId = ctx.from!.id;
+  const session = sessions.get(userId);
+
+  if (!session) {
+    await ctx.answerCbQuery('Сессия истекла. Нажмите «Сыграть!» ещё раз.');
+    return;
+  }
+
+  st = st || await loadStore();
+  const evs = st.draw.events;
+  const totalEvents = Math.min(EVENTS_COUNT, evs.length);
+
+  for (let i = 0; i < totalEvents; i++) {
+    const sel = session.selections[i] || [];
+    if (!sel.length) {
+      session.selections[i] = [Math.floor(Math.random() * 3)];
+    }
+  }
+
+  const text = buildPlayText(st.draw, session.selections);
+  const kb = buildPlayKb(session, st.draw);
+
+  await ctx.answerCbQuery('Пустые события заполнены случайным образом 🎲');
+  await safeEditMessage(ctx, text, kb);
+});
+
+// Сбросить все выборы
+bot.action('play:clearAll', async (ctx) => {
+  const userId = ctx.from!.id;
+  const session = sessions.get(userId);
+
+  if (!session) {
+    await ctx.answerCbQuery('Сессия уже очищена. Нажмите «Сыграть!» ещё раз.');
+    return;
+  }
+
+  st = st || await loadStore();
+  const evs = st.draw.events;
+  const totalEvents = Math.min(EVENTS_COUNT, evs.length);
+
+  for (let i = 0; i < totalEvents; i++) {
+    session.selections[i] = [];
+  }
+
+  const text = buildPlayText(st.draw, session.selections);
+  const kb = buildPlayKb(session, st.draw);
+
+  await ctx.answerCbQuery('Все выборы очищены 🧹');
+  await safeEditMessage(ctx, text, kb);
+});
+
+
+// --------------- Подтверждение билета ---------------
+bot.action('confirm_ticket', async (ctx) => {
+    const userId = ctx.from.id;
+    const session = sessions.get(userId);
+    if (!session) return ctx.answerCbQuery('Сессия истекла.');
+
+    const combos = countCombinations(session.selections);
+    if (combos === 0) {
+        return ctx.answerCbQuery('Выберите хотя бы один исход для каждого события!');
+    }
+
+    const priceRUB = calcStakeRUB(session.selections);
+    const priceCrypto = calcStakeCrypto(session.selections);
+    const invoice = genInvoice(userId, st.draw.id, combos);
+
+    const text = `✅ Билет готов!\n\nКомбинаций: ${combos}\nСтоимость: ${fmtMoney(priceRUB)} ₽ (${priceCrypto} ${CURRENCY})\n\nОплатите через TON-кошелёк.`;
+    const kb = {
+        inline_keyboard: [
+            [Markup.button.callback('💳 Оплатить', `pay:${invoice}`)],
+            [Markup.button.callback('❌ Отмена', 'play')]
+        ]
+    };
+
+    await ctx.answerCbQuery('');
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb });
+});
+
+// --------------- Оплата ---------------
+bot.action(/^pay:(.+)$/, async (ctx) => {
+    const invoiceId = ctx.match[1];
+    const userId = ctx.from.id;
+    const session = sessions.get(userId);
+    if (!session) return ctx.answerCbQuery('Сессия истекла.');
+
+    st = st || await loadStore();
+    const combos = countCombinations(session.selections);
+    const amount = calcStakeCrypto(session.selections);
+    const username = ctx.from.username || String(userId);
+
+    let paymentUrl = '';
+
+    if (CURRENCY === 'TON') {
+    // amount = calcStakeCrypto(selections) → в нашем случае = STAKE_TON
+    paymentUrl = `ton://transfer/${TON_RECEIVE_ADDRESS}?amount=${amount * 1e9}&text=${encodeURIComponent(invoiceId)}`;
+}
+
+
+    const ticket: Ticket = {
+        id: `${st.draw.id}_${st.nextTicketSeq++}`,
+        userId,
+        username,
+        selections: session.selections,
+        createdAt: new Date().toISOString(),
+        paid: false,
+        invoiceId
+    };
+
+    st.tickets.push(ticket);
+    st.payments[invoiceId] = {
+        userId,
+        currency: CURRENCY,
+        amount,
+        comment: invoiceId,
+        paid: false,
+        createdAt: new Date().toISOString()
+    };
+    await saveStore(st);
+
+    sessions.delete(userId);
+
+    const text = `💳 Оплатите билет #${ticket.id}\n\nСумма: ${amount} ${CURRENCY}\nКомментарий: ${invoiceId}\n\nИспользуйте ссылку:\n${paymentUrl}`;
+    await ctx.answerCbQuery('');
+    await ctx.editMessageText(text, {
+        parse_mode: 'HTML',
+        reply_markup: {
+            inline_keyboard: [
+                [Markup.button.url('💸 Оплатить', paymentUrl)],
+                [Markup.button.callback('🔄 Проверить оплату', `check:${invoiceId}`)],
+                [Markup.button.callback('🏠 Главная', 'home')]
+            ]
+        }
+    });
+	startAutoCheckTonPayment({
+  invoiceId,
+  userId,
+  chatId: ctx.chat!.id,
+  expectedAmountTon: amount, // amount должен быть в TON
+});
+
+// по желанию — отдельное сообщение игроку
+await ctx.reply('⏳ Жду оплату… Проверяю автоматически (примерно 5 минут).');
+});
+
+// --------------- Проверка оплаты ---------------
+bot.action(/^check:(.+)$/, async (ctx) => {
+    const invoiceId = ctx.match[1];
+    st = st || await loadStore();
+    const payment = st.payments[invoiceId];
+    if (!payment) return ctx.answerCbQuery('Инвойс не найден.');
+
+    let paid = false;
+    let txHash = '';
+
+    if (CURRENCY === 'TON') {
+        const result = await checkTonPayment({
+            toAddress: TON_RECEIVE_ADDRESS,
+            expectedAmountTon: payment.amount,
+            comment: invoiceId,
+            minConfirmations: TON_MIN_CONFIRMATIONS
+        });
+        paid = result.found;
+        txHash = result.txHash || '';
+    } else if (CURRENCY === 'USDT_TON') {
+        const result = await checkJettonPayment({
+            ownerBaseAddress: TON_RECEIVE_ADDRESS,
+            expectedAmountTokens: payment.amount,
+            comment: invoiceId,
+            minConfirmations: TON_MIN_CONFIRMATIONS
+        });
+        paid = result.found;
+        txHash = result.txHash || '';
+    }
+
+    if (paid && !payment.paid) {
+        payment.paid = true;
+        payment.txHash = txHash;
+        const ticket = st.tickets.find(t => t.invoiceId === invoiceId);
+        if (ticket) {
+            ticket.paid = true;
+            st.users[payment.userId].hasTicketForCurrent = true;
+            await saveStore(st);
+            await ctx.reply(`✅ Оплата подтверждена! Билет #${ticket.id} активирован.`, { parse_mode: 'HTML' });
+        }
+    } else if (paid) {
+        await ctx.answerCbQuery('Оплата уже подтверждена.');
+    } else {
+        await ctx.answerCbQuery('Оплата ещё не получена. Попробуйте позже.');
+    }
+});
+
+
+// --------------- Действия: Результаты и билеты ---------------
+bot.action('results', async (ctx) => {
+    st = st || await loadStore();
+    if (!st.draw.settlement) {
+        return ctx.answerCbQuery('Расчёт не завершён.');
+    }
+    const sett = st.draw.settlement;
+    const text = `🏆 Результаты тиража #${st.draw.id}\n\nМакс. совпадений: ${sett.maxHits}/${sett.totalPlayed}\nБанк: ${fmtMoney(sett.bankRUB)} ₽ (${sett.bankUSDT} ${CURRENCY})\n\nПобедители:\n${sett.winners.map(w => `@${esc(w.username || String(w.userId))}: ${w.hits} совпадений, ${fmtMoney(w.prizeRUB)} ₽ (${w.prizeUSDT} ${CURRENCY})`).join('\n') || 'Нет победителей.'}`;
+    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[Markup.button.callback('🏠 Главная', 'home')]] } });
+});
+
+function myTicketsPageText(tickets: Ticket[], page: number): string {
+    const start = (page - 1) * PAGE_SIZE;
+    const pageTickets = tickets.slice(start, start + PAGE_SIZE);
+    const lines = pageTickets.map(t => {
+        const hits = st.draw.settlement ? computeHits(st, t) : '?';
+        const status = t.paid ? '✅ Оплачен' : '⏳ Ожидает оплаты';
+        return `🎫 #${esc(t.id)} • ${hits} совпадений • ${fmtMoney(calcStakeRUB(t.selections))} ₽ • ${status}`;
+    });
+    return `🎫 Ваши билеты (страница ${page}/${Math.ceil(tickets.length / PAGE_SIZE)}):\n\n${lines.join('\n') || 'Нет билетов.'}`;
+}
+
+function myTicketsKb(tickets: Ticket[], page: number): InlineKeyboardMarkup {
+    const rows: any[] = [];
+    const totalPages = Math.ceil(tickets.length / PAGE_SIZE);
+    const start = (page - 1) * PAGE_SIZE;
+    const pageTickets = tickets.slice(start, start + PAGE_SIZE);
+    for (const t of pageTickets) {
+        rows.push([Markup.button.callback(`#${t.id} (${t.paid ? 'Оплачен' : 'Ожидает'})`, `mt:open:${t.id}:${page}`)]);
+    }
+    if (totalPages > 1) {
+        const nav = [];
+        if (page > 1) nav.push(Markup.button.callback('⬅️', `mt:page:${page - 1}`));
+        nav.push(Markup.button.callback(`${page}/${totalPages}`, `mt:page:${page}`));
+        if (page < totalPages) nav.push(Markup.button.callback('➡️', `mt:page:${page + 1}`));
+        rows.push(nav);
+    }
+    rows.push([Markup.button.callback('🏠 Главная', 'home')]);
+    return { inline_keyboard: rows };
+}
+
+bot.action(/^mt:page:(\d+)$/, async (ctx) => {
+    st = st || await loadStore();
+    const page = Number(ctx.match[1]);
+    const userId = ctx.from.id;
+    const myTickets = st.tickets.filter(t => t.userId === userId && t.id.startsWith(`${st.draw.id}_`));
+    const text = myTicketsPageText(myTickets, page);
+    const kb = myTicketsKb(myTickets, page);
+    await ctx.answerCbQuery('');
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb });
+});
+
+bot.action(/^mt:open:(.+?):(\d+)$/, async (ctx) => {
+    const ticketId = ctx.match[1];
+    const page = Number(ctx.match[2]);
+    st = st || await loadStore();
+    const t = st.tickets.find(x => x.id === ticketId);
+    if (!t) return ctx.answerCbQuery('Билет не найден.');
+    const text = formatTicketDetail(t);
+    const kb = {
+        inline_keyboard: [
+            t.paid ? [] : [Markup.button.callback('🔄 Проверить оплату', `check:${t.invoiceId}`)],
+            [Markup.button.callback('⬅️ Назад', `mt:page:${page}`)],
+            [Markup.button.callback('🏠 Главная', 'home')]
+        ].filter(r => r.length)
+    };
+    await ctx.answerCbQuery('');
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb });
+});
+
+function formatTicketDetail(t: Ticket): string {
+    const dt = new Date(t.createdAt);
+    const header = `🎫 Билет #${esc(t.id)} • ${dt.toLocaleString('ru-RU')} • ${t.paid ? '✅ Оплачен' : '⏳ Ожидает оплаты'}`;
+    const lines = t.selections.map((arr, i) => {
+        const items = arr.length ? arr.map(v => OUT_TEXT[v]).join(' / ') : '—';
+        const ev = st.draw?.events?.[i];
+        const title = ev?.title || `Событие ${i + 1}`;
+        const result = ev?.result !== null ? ` → ${OUT_TEXT[ev.result]}${ev.isVoid ? ' (аннулировано)' : ''}` : '';
+        return `${String(i + 1).padStart(2, '0')} ${esc(title)}: ${esc(items)}${result}`;
+    });
+    const price = fmtMoney(calcStakeRUB(t.selections));
+    const priceCrypto = calcStakeCrypto(t.selections);
+    const hits = computeHits(st, t);
+    return `${header}\n<pre>№   Матч: Исход(ы)\n${lines.join('\n')}</pre>\n💸 ${price} ₽ (${priceCrypto} ${CURRENCY})\n🎯 ${hits} совпадений`;
+}
+
+// --------------- Админ: билеты ---------------
+function adminTicketsPageText(tickets: Ticket[], page: number): string {
+    const start = (page - 1) * ADMIN_PAGE_SIZE;
+    const pageTickets = tickets.slice(start, start + ADMIN_PAGE_SIZE);
+    const lines = pageTickets.map(t => `🎫 #${esc(t.id)} • @${esc(t.username || String(t.userId))} • ${fmtMoney(calcStakeRUB(t.selections))} ₽ • ${t.paid ? '✅ Оплачен' : '⏳ Ожидает'}`);
+    const total = tickets.length;
+    return `📊 Всего билетов: ${total}\nСтраница ${page}/${Math.ceil(total / ADMIN_PAGE_SIZE)}\n\n${lines.join('\n') || 'Нет билетов.'}`;
 }
 
 function adminTicketsKb(tickets: Ticket[], page: number): InlineKeyboardMarkup {
-  const rows: any[] = [];
-  const total = tickets.length;
-  const totalPages = Math.max(1, Math.ceil(total / ADMIN_PAGE_SIZE));
-  const start = (page - 1) * ADMIN_PAGE_SIZE;
-  const slice = tickets.slice(start, start + ADMIN_PAGE_SIZE);
-
-  slice.forEach((t) => {
-    rows.push([Markup.button.callback('🔍 Открыть', `at:open:${t.id}:${page}`)]);
-  });
-
-  const nav: any[] = [];
-  if (page > 1) nav.push(Markup.button.callback('⬅️ Пред.', `at:page:${page - 1}`));
-  if (page < totalPages) nav.push(Markup.button.callback('➡️ След.', `at:page:${page + 1}`));
-  if (nav.length) rows.push(nav);
-
-  rows.push([
-    Markup.button.callback('⬇️ TXT', 'at:exp:txt'),
-    Markup.button.callback('⬇️ CSV', 'at:exp:csv'),
-    Markup.button.callback('⬇️ JSON', 'at:exp:json'),
-  ]);
-
-  rows.push([Markup.button.callback('⬅️ Назад', 'a:back')]);
-  rows.push([Markup.button.callback('🏠 На главную', 'home')]);
-  return { inline_keyboard: rows };
+    const rows: any[] = [];
+    const totalPages = Math.ceil(tickets.length / ADMIN_PAGE_SIZE);
+    const start = (page - 1) * ADMIN_PAGE_SIZE;
+    const pageTickets = tickets.slice(start, start + ADMIN_PAGE_SIZE);
+    for (const t of pageTickets) {
+        rows.push([Markup.button.callback(`#${t.id} (${t.paid ? 'Оплачен' : 'Ожидает'})`, `at:open:${t.id}:${page}`)]);
+    }
+    if (totalPages > 1) {
+        const nav = [];
+        if (page > 1) nav.push(Markup.button.callback('⬅️', `at:page:${page - 1}`));
+        nav.push(Markup.button.callback(`${page}/${totalPages}`, `at:page:${page}`));
+        if (page < totalPages) nav.push(Markup.button.callback('➡️', `at:page:${page + 1}`));
+        rows.push(nav);
+    }
+    rows.push([
+        Markup.button.callback('📤 Экспорт', 'at:exp'),
+        Markup.button.callback('⬅️ Админ', 'admin')
+    ]);
+    return { inline_keyboard: rows };
 }
 
-bot.action('a:tickets', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  const tickets = getAllTicketsSorted();
-  const page = 1;
-  const text = adminTicketsPageText(tickets, page);
-  const kb = adminTicketsKb(tickets, page);
-  await ctx.answerCbQuery('');
-  await ctx.editMessageText(text, { reply_markup: kb });
+bot.action('at:list', async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    st = st || await loadStore();
+    const tickets = getAllTicketsSorted();
+    const page = 1;
+    const text = adminTicketsPageText(tickets, page);
+    const kb = adminTicketsKb(tickets, page);
+    await ctx.answerCbQuery('');
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb });
 });
 
 bot.action(/^at:page:(\d+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  const page = Number(ctx.match[1]);
-  const tickets = getAllTicketsSorted();
-  const text = adminTicketsPageText(tickets, page);
-  const kb = adminTicketsKb(tickets, page);
-  await ctx.answerCbQuery('');
-  await ctx.editMessageText(text, { reply_markup: kb });
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    st = st || await loadStore();
+    const page = Number(ctx.match[1]);
+    const tickets = getAllTicketsSorted();
+    const text = adminTicketsPageText(tickets, page);
+    const kb = adminTicketsKb(tickets, page);
+    await ctx.answerCbQuery('');
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb });
+});
+
+bot.action(/^at:open:(.+?):(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    st = st || await loadStore();
+    const ticketId = ctx.match[1];
+    const page = Number(ctx.match[2]);
+    const tickets = getAllTicketsSorted();
+    const t = tickets.find(x => x.id === ticketId);
+    if (!t) {
+        await ctx.answerCbQuery('Билет не найден');
+        return;
+    }
+    const text = formatTicketDetailAdmin(t);
+    const rows: any[] = [];
+    const idx = tickets.findIndex(x => x.id === ticketId);
+    const prev = idx > 0 ? tickets[idx - 1] : null;
+    const next = idx >= 0 && idx < tickets.length - 1 ? tickets[idx + 1] : null;
+    const nav: any[] = [];
+    if (prev) nav.push(Markup.button.callback('⏮️ Пред. билет', `at:open:${prev.id}:${page}`));
+    if (next) nav.push(Markup.button.callback('⏭️ След. билет', `at:open:${next.id}:${page}`));
+    if (nav.length) rows.push(nav);
+    rows.push([Markup.button.callback('⬅️ Назад', `at:page:${page}`)]);
+    rows.push([Markup.button.callback('🏠 На главную', 'home')]);
+    const kb: InlineKeyboardMarkup = { inline_keyboard: rows };
+    await ctx.answerCbQuery('');
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb });
 });
 
 function formatTicketDetailAdmin(t: Ticket) {
-  const dt = new Date(t.createdAt);
-  const hh = String(dt.getHours()).padStart(2, '0');
-  const mm = String(dt.getMinutes()).padStart(2, '0');
-  const dd = String(dt.getDate()).padStart(2, '0');
-  const mo = String(dt.getMonth() + 1).padStart(2, '0');
-
-  const header = `🎫 Билет #${esc(t.id)} • @${esc(t.username || String(t.userId))} • ${dd}.${mo} ${hh}:${mm}`;
-  const lines = t.selections.map((arr, i) => {
-    const OUT = OUT_TEXT;
-    const items = (arr && arr.length) ? arr.map(v => OUT[v]).join(' / ') : '—';
-    const ev = st.draw?.events?.[i];
-    const title = ev?.title || `Событие ${i + 1}`;
-    return `${String(i + 1).padStart(2, '0')}  ${esc(title)}: ${esc(items)}`;
-  });
-
-  const price = fmtMoney(calcStakeRUB(t.selections));
-
-  return `${esc(header)}\n<pre>№   Матч: Исход(ы)\n${lines.join('\n')}</pre>\n💸 <b>Стоимость билета: ${price} ₽</b>\n🎯 Участвует в тираже #${st.draw.id}`;
+    const dt = new Date(t.createdAt);
+    const hh = String(dt.getHours()).padStart(2, '0');
+    const mm = String(dt.getMinutes()).padStart(2, '0');
+    const dd = String(dt.getDate()).padStart(2, '0');
+    const mo = String(dt.getMonth() + 1).padStart(2, '0');
+    const header = `🎫 Билет #${esc(t.id)} • @${esc(t.username || String(t.userId))} • ${dd}.${mo} ${hh}:${mm} • ${t.paid ? '✅ Оплачен' : '⏳ Ожидает'}${t.invoiceId ? ` • Инвойс: ${t.invoiceId}` : ''}`;
+    const lines = t.selections.map((arr, i) => {
+        const items = arr.length ? arr.map(v => OUT_TEXT[v]).join(' / ') : '—';
+        const ev = st.draw?.events?.[i];
+        const title = ev?.title || `Событие ${i + 1}`;
+        const result = ev?.result !== null ? ` → ${OUT_TEXT[ev.result]}${ev.isVoid ? ' (аннулировано)' : ''}` : '';
+        return `${String(i + 1).padStart(2, '0')} ${esc(title)}: ${esc(items)}${result}`;
+    });
+    const price = fmtMoney(calcStakeRUB(t.selections));
+    const priceCrypto = calcStakeCrypto(t.selections);
+    const hits = computeHits(st, t);
+    return `${header}\n<pre>№   Матч: Исход(ы)\n${lines.join('\n')}</pre>\n💸 ${price} ₽ (${priceCrypto} ${CURRENCY})\n🎯 ${hits} совпадений`;
 }
 
-bot.action(/^at:open:(.+?):(\d+)$/, async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  const ticketId = ctx.match[1];
-  const page = Number(ctx.match[2]);
-  const tickets = getAllTicketsSorted();
-  const t = tickets.find(x => x.id === ticketId);
-  if (!t) {
-    await ctx.answerCbQuery('Билет не найден');
-    return;
-  }
-  const text = formatTicketDetailAdmin(t);
-
-  const rows: any[] = [];
-  const idx = tickets.findIndex(x => x.id === ticketId);
-  const prev = idx > 0 ? tickets[idx - 1] : null;
-  const next = idx >= 0 && idx < tickets.length - 1 ? tickets[idx + 1] : null;
-  const nav: any[] = [];
-  if (prev) nav.push(Markup.button.callback('⏮️ Пред. билет', `at:open:${prev.id}:${page}`));
-  if (next) nav.push(Markup.button.callback('⏭️ След. билет', `at:open:${next.id}:${page}`));
-  if (nav.length) rows.push(nav);
-  rows.push([Markup.button.callback('⬅️ Назад', `at:page:${page}`)]);
-  rows.push([Markup.button.callback('🏠 На главную', 'home')]);
-  const kb: InlineKeyboardMarkup = { inline_keyboard: rows };
-
-  await ctx.answerCbQuery('');
-  await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb });
+// --------------- Админ: экспорт ---------------
+bot.action('at:exp', async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    st = st || await loadStore();
+    const kb = {
+        inline_keyboard: [
+            [Markup.button.callback('📄 TXT', 'at:exp:txt')],
+            [Markup.button.callback('📊 CSV', 'at:exp:csv')],
+            [Markup.button.callback('📋 JSON', 'at:exp:json')],
+            [Markup.button.callback('⬅️ Админ', 'admin')]
+        ]
+    };
+    await ctx.answerCbQuery('');
+    await ctx.editMessageText('📤 Выберите формат экспорта:', { parse_mode: 'HTML', reply_markup: kb });
 });
 
-// Экспорты всех билетов для админа
 bot.action('at:exp:txt', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  const tickets = getAllTicketsSorted();
-
-  if (!tickets.length) {
-    await ctx.answerCbQuery('');
-    await ctx.reply('Нет билетов для экспорта.', { reply_markup: adminKb(st.draw) });
-    return;
-  }
-
-  const blocks = tickets.map(t => {
-    const head = `#${t.id} • u:${t.userId} • ${new Date(t.createdAt).toISOString()}`;
-    const body = t.selections.map((arr, i) => {
-      const OUT = OUTCOMES;
-      const items = (arr && arr.length) ? arr.map(v => OUT[v]).join('/') : '-';
-      return `${String(i + 1).padStart(2, '0')}  ${items}`;
-    }).join('\n');
-    const price = fmtMoney(calcStakeRUB(t.selections));
-    return `${head}\n${body}\n💸 ${price} ₽`;
-  });
-  const content = blocks.join('\n\n');
-  const buf = Buffer.from(content, 'utf8');
-
-  await ctx.answerCbQuery('Экспорт TXT сформирован');
-  await (ctx as any).replyWithDocument({ source: buf, filename: `tickets_all.txt` });
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    st = st || await loadStore();
+    const tickets = getAllTicketsSorted();
+    if (!tickets.length) {
+        await ctx.answerCbQuery('');
+        await ctx.reply('Нет билетов для экспорта.', { parse_mode: 'HTML', reply_markup: adminKb(st.draw) });
+        return;
+    }
+    const blocks = tickets.map(t => {
+        const head = `#${t.id} • u:${t.userId} • ${new Date(t.createdAt).toISOString()} • ${t.paid ? 'Оплачен' : 'Ожидает'}${t.invoiceId ? ` • ${t.invoiceId}` : ''}`;
+        const body = t.selections.map((arr, i) => {
+            const items = arr.length ? arr.map(v => OUTCOMES[v]).join('/') : '-';
+            return `${String(i + 1).padStart(2, '0')} ${items}`;
+        }).join('\n');
+        const price = fmtMoney(calcStakeRUB(t.selections));
+        const priceCrypto = calcStakeCrypto(t.selections);
+        return `${head}\n${body}\n💸 ${price} ₽ (${priceCrypto} ${CURRENCY})`;
+    });
+    const content = blocks.join('\n\n');
+    const buf = Buffer.from(content, 'utf8');
+    await ctx.answerCbQuery('Экспорт TXT сформирован');
+    await ctx.replyWithDocument({ source: buf, filename: `tickets_draw_${st.draw.id}.txt` });
 });
 
 bot.action('at:exp:csv', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  const tickets = getAllTicketsSorted();
-
-  if (!tickets.length) {
-    await ctx.answerCbQuery('');
-    await ctx.reply('Нет билетов для экспорта.', { reply_markup: adminKb(st.draw) });
-    return;
-  }
-
-  const header = ['ticket_id', 'user_id', 'created_at', ...Array.from({ length: EVENTS_COUNT }, (_, i) => `e${String(i + 1).padStart(2, '0')}`), 'stake_rub'];
-  const rows = tickets.map(t => {
-    const cols = Array.from({ length: EVENTS_COUNT }, (_, i) => {
-      const arr = t.selections[i] || [];
-      const OUT = OUTCOMES;
-      return arr.length ? arr.map(v => OUT[v]).join('/') : '-';
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    st = st || await loadStore();
+    const tickets = getAllTicketsSorted();
+    if (!tickets.length) {
+        await ctx.answerCbQuery('');
+        await ctx.reply('Нет билетов для экспорта.', { parse_mode: 'HTML', reply_markup: adminKb(st.draw) });
+        return;
+    }
+    const header = ['ticket_id', 'user_id', 'username', 'created_at', 'paid', 'invoice_id', ...Array.from({ length: EVENTS_COUNT }, (_, i) => `e${String(i + 1).padStart(2, '0')}`), 'stake_rub', `stake_${CURRENCY.toLowerCase()}`];
+    const rows = tickets.map(t => {
+        const cols = Array.from({ length: EVENTS_COUNT }, (_, i) => {
+            const arr = t.selections[i] || [];
+            return arr.length ? arr.map(v => OUTCOMES[v]).join('/') : '-';
+        });
+        return [t.id, String(t.userId), t.username || '', new Date(t.createdAt).toISOString(), String(t.paid), t.invoiceId || '', ...cols, String(calcStakeRUB(t.selections)), String(calcStakeCrypto(t.selections))];
     });
-    const price = String(calcStakeRUB(t.selections));
-    return [t.id, String(t.userId), new Date(t.createdAt).toISOString(), ...cols, price];
-  });
-
-  const escCsv = (s: string) => /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  const csv = [header.map(escCsv).join(','), ...rows.map(r => r.map(escCsv).join(','))].join('\n');
-  const buf = Buffer.from(csv, 'utf8');
-
-  await ctx.answerCbQuery('Экспорт CSV сформирован');
-  await (ctx as any).replyWithDocument({ source: buf, filename: `tickets_all.csv` });
+    const escCsv = (s: string) => /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    const csv = [header.map(escCsv).join(','), ...rows.map(r => r.map(escCsv).join(','))].join('\n');
+    const buf = Buffer.from(csv, 'utf8');
+    await ctx.answerCbQuery('Экспорт CSV сформирован');
+    await ctx.replyWithDocument({ source: buf, filename: `tickets_draw_${st.draw.id}.csv` });
 });
 
 bot.action('at:exp:json', async (ctx) => {
-  if (!isAdmin(ctx)) return;
-  st = st || await loadStore();
-  const tickets = getAllTicketsSorted();
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    st = st || await loadStore();
+    const tickets = getAllTicketsSorted();
+    if (!tickets.length) {
+        await ctx.answerCbQuery('');
+        await ctx.reply('Нет билетов для экспорта.', { parse_mode: 'HTML', reply_markup: adminKb(st.draw) });
+        return;
+    }
+    const payload = JSON.stringify(tickets.map(t => ({
+        id: t.id,
+        userId: t.userId,
+        username: t.username,
+        createdAt: t.createdAt,
+        paid: t.paid,
+        invoiceId: t.invoiceId,
+        selections: t.selections,
+        stakeRUB: calcStakeRUB(t.selections),
+        stakeCrypto: calcStakeCrypto(t.selections)
+    })), null, 2);
+    const buf = Buffer.from(payload, 'utf8');
+    await ctx.answerCbQuery('Экспорт JSON сформирован');
+    await ctx.replyWithDocument({ source: buf, filename: `tickets_draw_${st.draw.id}.json` });
+});
 
-  if (!tickets.length) {
+// --------------- Админ: управление тиражом ---------------
+bot.action('as:stats', async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    st = st || await loadStore();
+    const tickets = st.tickets.filter(t => t.id.startsWith(`${st.draw.id}_`));
+    const paidTickets = tickets.filter(t => t.paid);
+    const totalStakesRUB = tickets.reduce((sum, t) => sum + calcStakeRUB(t.selections), 0);
+    const totalStakesCrypto = tickets.reduce((sum, t) => sum + calcStakeCrypto(t.selections), 0);
+    const paidStakesRUB = paidTickets.reduce((sum, t) => sum + calcStakeRUB(t.selections), 0);
+    const paidStakesCrypto = paidTickets.reduce((sum, t) => sum + calcStakeCrypto(t.selections), 0);
+    const text = `📊 Статистика тиража #${st.draw.id}\n\nСтатус: ${st.draw.status}\nСобытий: ${st.draw.events.length}\nБилетов: ${tickets.length} (оплачено: ${paidTickets.length})\nОбщий банк: ${fmtMoney(totalStakesRUB)} ₽ (${totalStakesCrypto} ${CURRENCY})\nОплаченный банк: ${fmtMoney(paidStakesRUB)} ₽ (${paidStakesCrypto} ${CURRENCY})`;
     await ctx.answerCbQuery('');
-    await ctx.reply('Нет билетов для экспорта.', { reply_markup: adminKb(st.draw) });
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: adminKb(st.draw) });
+});
+
+
+
+// --- Adapter: SettlementResult (из settlement.ts) -> Settlement (структура бота)
+function mapSettlementResultToBotSettlement(
+  st: Store,
+  result: any, // SettlementResult
+  currency: 'TON' | 'USDT_TON',
+  bankRub: number
+): Settlement {
+  return {
+    settledAt: new Date().toISOString(),
+    totalPlayed: st.tickets.filter(t => t.id.startsWith(`${st.draw.id}_`)).length,
+    maxHits: result.maxHitsInDraw,
+    bankRUB: bankRub,
+    bankUSDT: currency === 'USDT_TON' ? result.prizePool : undefined,
+    formulaName: result.formulaName,
+    formulaParams: result.formulaParams,
+    formulaVersion: result.formulaVersion,
+    winners: (result.payouts || []).map((p: any) => ({
+      ticketId: '', // при желании можно найти конкретный билет по userId
+      userId: p.userId,
+      username: st.users[p.userId]?.username,
+      hits: p.hits,
+      prizeRUB: currency === 'TON' ? p.amount : 0,
+      prizeUSDT: currency === 'USDT_TON' ? p.amount : undefined,
+    })),
+  };
+}
+
+
+
+// --------------- Админ: редактор событий ---------------
+bot.action('ae:edit', async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    st = st || await loadStore();
+    const page = 1;
+    const text = `📝 Редактор событий (тираж #${st.draw.id})\n\n${st.draw.events.length} из ${EVENTS_COUNT} событий`;
+    const kb = adminEditKb(page, st.draw.events);
+    await ctx.answerCbQuery('');
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb });
+});
+
+bot.action(/^ae:page:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    st = st || await loadStore();
+    const page = Number(ctx.match[1]);
+    const text = `📝 Редактор событий (тираж #${st.draw.id})\n\n${st.draw.events.length} из ${EVENTS_COUNT} событий`;
+    const kb = adminEditKb(page, st.draw.events);
+    await ctx.answerCbQuery('');
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb });
+});
+
+bot.action(/^ae:open:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    st = st || await loadStore();
+    const idx = Number(ctx.match[1]);
+    const ev = st.draw.events.find(e => e.idx === idx);
+    if (!ev) return ctx.answerCbQuery('Событие не найдено.');
+    const resultText = ev.result !== null ? OUT_TEXT[ev.result] : 'Не установлено';
+    const text = `📝 Событие #${idx + 1}\n\nНазвание: ${esc(ev.title)}\nРезультат: ${resultText}${ev.isVoid ? ' (аннулировано)' : ''}\nИсточник: ${ev.sourceUrl || 'Не указан'}`;
+    const kb = {
+        inline_keyboard: [
+            [Markup.button.callback('✏️ Название', `ae:set_title:${idx}`)],
+            [Markup.button.callback('📊 Установить результат', `ae:set_result:${idx}`)],
+            [Markup.button.callback(ev.isVoid ? '✅ Восстановить' : '🗑️ Аннулировать', `ae:toggle_void:${idx}`)],
+            [Markup.button.callback('🔗 Источник', `ae:set_source:${idx}`)],
+            [Markup.button.callback('⬅️ Назад', `ae:edit`)]
+        ]
+    };
+    await ctx.answerCbQuery('');
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: kb });
+});
+
+bot.action(/^ae:set_title:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    const idx = Number(ctx.match[1]);
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    adminTextActions.set(userId, { type: 'set_title', idx });
+
+    await ctx.answerCbQuery('Введите название события:');
+    await ctx.reply(`✏️ Введите новое название для события #${idx + 1}:`);
+});
+
+
+bot.action(/^ae:set_result:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    const idx = Number(ctx.match[1]);
+    const kb = {
+        inline_keyboard: [
+            [Markup.button.callback('1️⃣ Победа 1', `ae:result:${idx}:0`)],
+            [Markup.button.callback('2️⃣ Ничья', `ae:result:${idx}:1`)],
+            [Markup.button.callback('3️⃣ Победа 2', `ae:result:${idx}:2`)],
+            [Markup.button.callback('🚫 Сбросить', `ae:result:${idx}:null`)],
+            [Markup.button.callback('⬅️ Назад', `ae:open:${idx}`)]
+        ]
+    };
+    await ctx.answerCbQuery('');
+    await ctx.editMessageText(`📊 Установите результат для события #${idx + 1}`, { parse_mode: 'HTML', reply_markup: kb });
+});
+
+bot.action(/^ae:result:(\d+):(null|\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    st = st || await loadStore();
+    const idx = Number(ctx.match[1]);
+    const result = ctx.match[2] === 'null' ? null : Number(ctx.match[2]);
+    const ev = st.draw.events.find(e => e.idx === idx);
+    if (!ev) return ctx.answerCbQuery('Событие не найдено.');
+    ev.result = result;
+    await saveStore(st);
+    await ctx.answerCbQuery(`Результат ${result === null ? 'сброшен' : `установлен: ${OUT_TEXT[result]}`}`);
+    await ctx.editMessageText(`📝 Событие #${idx + 1}\n\nНазвание: ${esc(ev.title)}\nРезультат: ${result === null ? 'Не установлено' : OUT_TEXT[result]}${ev.isVoid ? ' (аннулировано)' : ''}`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[Markup.button.callback('⬅️ Назад', `ae:open:${idx}`)]] } });
+});
+
+bot.action(/^ae:toggle_void:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    st = st || await loadStore();
+    const idx = Number(ctx.match[1]);
+    const ev = st.draw.events.find(e => e.idx === idx);
+    if (!ev) return ctx.answerCbQuery('Событие не найдено.');
+    ev.isVoid = !ev.isVoid;
+    if (ev.isVoid) ev.result = null;
+    await saveStore(st);
+    await ctx.answerCbQuery(ev.isVoid ? 'Событие аннулировано' : 'Событие восстановлено');
+    await ctx.editMessageText(`📝 Событие #${idx + 1}\n\nНазвание: ${esc(ev.title)}\nРезультат: ${ev.result === null ? 'Не установлено' : OUT_TEXT[ev.result]}${ev.isVoid ? ' (аннулировано)' : ''}`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[Markup.button.callback('⬅️ Назад', `ae:open:${idx}`)]] } });
+});
+
+bot.action(/^ae:set_source:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    const idx = Number(ctx.match[1]);
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    adminTextActions.set(userId, { type: 'set_source', idx });
+
+    await ctx.answerCbQuery('Введите URL источника:');
+    await ctx.reply(`🔗 Введите URL источника для события #${idx + 1}:`);
+});
+
+
+bot.action('ae:add', async (ctx) => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+    st = st || await loadStore();
+
+    if (st.draw.events.length >= EVENTS_COUNT) {
+        return ctx.answerCbQuery(`Максимум ${EVENTS_COUNT} событий!`);
+    }
+
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    adminTextActions.set(userId, { type: 'add_event' });
+
+    await ctx.answerCbQuery('Введите название нового события:');
+    await ctx.reply('➕ Введите название нового события:');
+});
+
+
+bot.on('text', async (ctx) => {
+    if (!isAdmin(ctx)) return;
+
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    const action = adminTextActions.get(userId);
+    if (!action) return; // это обычное сообщение, не в рамках админ-действия
+
+    st = st || await loadStore();
+    const text = ctx.message.text;
+
+    if (action.type === 'set_title' && action.idx !== undefined) {
+        const ev = st.draw.events.find(e => e.idx === action.idx);
+        if (!ev) {
+            await ctx.reply('Событие не найдено.');
+        } else {
+            ev.title = text;
+            await saveStore(st);
+            await ctx.reply(
+                `✅ Название события #${action.idx + 1} обновлено: ${esc(ev.title)}`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[Markup.button.callback('⬅️ Редактор', 'ae:edit')]] }
+                }
+            );
+        }
+    } else if (action.type === 'set_source' && action.idx !== undefined) {
+        const ev = st.draw.events.find(e => e.idx === action.idx);
+        if (!ev) {
+            await ctx.reply('Событие не найдено.');
+        } else {
+            ev.sourceUrl = text;
+            await saveStore(st);
+            await ctx.reply(
+                `🔗 Источник для события #${action.idx + 1} обновлён.`,
+                {
+                    parse_mode: 'HTML',
+                    reply_markup: { inline_keyboard: [[Markup.button.callback('⬅️ Редактор', 'ae:edit')]] }
+                }
+            );
+        }
+    } else if (action.type === 'add_event') {
+        const idx = st.draw.events.length;
+        st.draw.events.push({
+            idx,
+            title: text,
+            result: null,
+            isVoid: false,
+        });
+        await saveStore(st);
+        await ctx.reply(
+            `➕ Событие #${idx + 1} добавлено: ${esc(text)}`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[Markup.button.callback('⬅️ Редактор', 'ae:edit')]] }
+            }
+        );
+    }
+
+    // Чистим состояние для этого админа
+    adminTextActions.delete(userId);
+});
+
+
+// --------------- Главная ---------------
+bot.action('home', async (ctx) => {
+    st = st || await loadStore();
+    const text = `🏠 Тотализатор 15×3 • Тираж #${st.draw.id} (${st.draw.status})`;
+    await ctx.answerCbQuery('');
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: mainKb(ctx, st.draw) });
+});
+
+// 🚀 Старт тиража (из setup -> open)
+bot.action('as:start', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет прав');
+  st = st || await loadStore();
+
+  if (st.draw.status !== 'setup') {
+    await ctx.answerCbQuery('');
+    await ctx.reply(`Нельзя запустить: текущий статус ${st.draw.status}.`);
+    return;
+  }
+  // валидация: должны быть заведены события
+  if (!st.draw.events || st.draw.events.length !== EVENTS_COUNT) {
+    await ctx.answerCbQuery('');
+    await ctx.reply(`Сначала настройте ${EVENTS_COUNT} событий в редакторе (ae:edit). Сейчас: ${st.draw.events?.length || 0}`);
     return;
   }
 
-  const payload = JSON.stringify(tickets, null, 2);
-  const buf = Buffer.from(payload, 'utf8');
-
-  await ctx.answerCbQuery('Экспорт JSON сформирован');
-  await (ctx as any).replyWithDocument({ source: buf, filename: `tickets_all.json` });
+  st.draw.status = 'open';
+  await saveStore(st);
+  await ctx.answerCbQuery('Тираж открыт');
+  await ctx.editMessageText(`🔧 Админ-панель: Тираж #${st.draw.id} (${st.draw.status})`, { reply_markup: adminKb(st.draw), parse_mode: 'HTML' });
 });
+
+// 🔒 Закрыть приём ставок (open -> closed)
+bot.action('as:close', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет прав');
+  st = st || await loadStore();
+
+  if (st.draw.status !== 'open') {
+    await ctx.answerCbQuery('');
+    await ctx.reply(`Нельзя закрыть: текущий статус ${st.draw.status}.`);
+    return;
+  }
+  st.draw.status = 'closed';
+  await saveStore(st);
+  await ctx.answerCbQuery('Приём ставок закрыт');
+  await ctx.editMessageText(`🔧 Админ-панель: Тираж #${st.draw.id} (${st.draw.status})`, { reply_markup: adminKb(st.draw), parse_mode: 'HTML' });
+});
+
+// ✅ Завершить (closed -> settled) + расчёт выплат
+bot.action('as:settle', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Нет прав');
+  st = st || await loadStore();
+
+  if (st.draw.status !== 'closed') {
+    await ctx.answerCbQuery('');
+    await ctx.reply(`Нельзя завершить: текущий статус ${st.draw.status}. Сначала закройте приём ставок (as:close).`);
+    return;
+  }
+
+  // 1) Сколько событий реально сыграло (есть result и не void)
+  const resolvedEvents = (st.draw.events || []).filter(ev => ev && ev.result !== null && !ev.isVoid);
+  const maxPossibleHits = resolvedEvents.length;
+
+  // 2) Оплаченные билеты текущего тиража
+  const tickets = st.tickets.filter(t => t.id.startsWith(`${st.draw.id}_`) && t.paid);
+
+  // 3) Лучший результат (максимум совпадений) по пользователю
+  const hitsByUserMap = new Map<number, { userId: number; wallet: string; hits: number }>();
+  for (const t of tickets) {
+    const hits = computeHits(st, t);
+    const prev = hitsByUserMap.get(t.userId);
+    const best = prev ? Math.max(prev.hits, hits) : hits; // берём максимум
+    hitsByUserMap.set(t.userId, {
+      userId: t.userId,
+      wallet: st.users[t.userId]?.wallet || '',
+      hits: best
+    });
+  }
+  const hitsByUser = Array.from(hitsByUserMap.values());
+
+  // 4) Банк из реально оплаченных платежей
+  let totalBank = 0;
+  for (const t of tickets) {
+    const inv = t.invoiceId ? st.payments[t.invoiceId] : undefined;
+    if (inv && inv.paid && inv.currency === CURRENCY) {
+      totalBank += inv.amount; // TON или USDT_TON (в зависимости от CURRENCY)
+    }
+  }
+
+  // 5) Подготовка входа в формулу
+  const input = {
+    drawId: String(st.draw.id),
+    totalBank,
+    maxHitsInDraw: maxPossibleHits,
+    hitsByUser
+  };
+
+  // 6) Вызов формулы (по умолчанию TIERED_WEIGHTS)
+  const params =
+    PAYOUT_FORMULA === 'MAX_HITS_EQUAL_SHARE' ? PAYOUT_PARAMS_MAX_HITS_EQUAL_SHARE :
+    PAYOUT_FORMULA === 'TIERED_WEIGHTS'      ? PAYOUT_PARAMS_TIERED_WEIGHTS :
+    PAYOUT_FORMULA === 'FIXED_TABLE'         ? PAYOUT_PARAMS_FIXED_TABLE :
+                                                PAYOUT_PARAMS_MAX_HITS_EQUAL_SHARE;
+
+  const result = calculatePayouts(PAYOUT_FORMULA as FormulaName, input as any, params as any);
+
+  // 7) Сохранение итогов
+  st.draw.status = 'settled';
+  st.draw.settlement = mapSettlementResultToBotSettlement(
+    st,
+    result as any,
+    CURRENCY,
+    /* bankRub */ 0 // если нужен ещё рублевый банк — подставь сюда
+  );
+  await saveStore(st);
+
+  // 8) Сообщение админу
+  const winnersText = (st.draw.settlement.winners || [])
+    .map(w => `@${w.username || w.userId}: ${w.hits} совп., ${CURRENCY === 'TON' ? `${w.prizeRUB} TON` : `${w.prizeUSDT} USDT`}`)
+    .join('\n') || 'Нет победителей.';
+  await ctx.answerCbQuery('');
+  await ctx.editMessageText(
+    `🔧 Админ-панель: Тираж #${st.draw.id} (${st.draw.status})`,
+    { reply_markup: adminKb(st.draw), parse_mode: 'HTML' }
+  );
+  await ctx.reply(
+    `✅ Тираж #${st.draw.id} рассчитан\n` +
+    `Макс. попаданий: ${st.draw.settlement.maxHits}/${maxPossibleHits}\n` +
+    `Формула: ${st.draw.settlement.formulaName}\n` +
+    `Банк: ${result.prizePool} ${CURRENCY === 'TON' ? 'TON' : 'USDT'}\n\n` +
+    `Победители:\n${winnersText}`
+  );
+
+  // 9) ДМ победителям
+  for (const w of st.draw.settlement.winners || []) {
+    try {
+      const prizeStr = CURRENCY === 'TON' ? `${w.prizeRUB} TON` : `${w.prizeUSDT} USDT`;
+      await ctx.telegram.sendMessage(
+        w.userId,
+        `🏆 Поздравляем! Ваш результат: ${w.hits} совпаданий.\n` +
+        `Приз: ${prizeStr}\n\n` +
+        `Спасибо за участие в тираже #${st.draw.id}!`
+      );
+    } catch {}
+  }
+});
+
+// 🆕 Новый тираж (доступно только из settled)
+bot.action('as:newdraw', async (ctx) => {
+    if (!isAdmin(ctx)) {
+        return ctx.answerCbQuery('Нет прав');
+    }
+
+    st = st || await loadStore();
+
+    if (st.draw.status !== 'settled') {
+        await ctx.answerCbQuery('');
+        await ctx.reply(`Новый тираж можно создать только из статуса "settled". Сейчас: ${st.draw.status}.`);
+        return;
+    }
+
+    const oldDrawId = st.draw.id;
+
+    // 1. Архивируем старый тираж
+    try {
+        const historyDir = path.join(DATA_DIR, 'history');
+        await fs.mkdir(historyDir, { recursive: true });
+
+        const historyPath = path.join(historyDir, `draw_${oldDrawId}.json`);
+        const snapshot = {
+            exportedAt: new Date().toISOString(),
+            draw: st.draw,
+            tickets: st.tickets,
+            payments: st.payments,
+        };
+
+        await fs.writeFile(historyPath, JSON.stringify(snapshot, null, 2), 'utf-8');
+        console.log(`🗂 Архивирован тираж #${oldDrawId} -> ${historyPath}`);
+    } catch (e) {
+        console.error('Ошибка архивации тиража перед созданием нового:', e);
+        // не выкидываем ошибку наружу, просто логируем
+    }
+
+    // 2. Готовим новый пустой тираж
+    const newDrawId = oldDrawId + 1;
+
+    st.draw = {
+        id: newDrawId,
+        status: 'setup',
+        createdAt: new Date().toISOString(),
+        events: [],
+        settlement: undefined,
+    } as any; // если TS ругнётся на тип, это можно потом подправить
+
+    // 3. Очищаем билеты, платежи и счётчик
+    st.tickets = [];
+    st.payments = {};
+    st.nextTicketSeq = 1;
+
+    // 4. Сбрасываем флаг "у меня есть билет" у всех пользователей
+    if (st.users && typeof st.users === 'object') {
+        for (const key in st.users) {
+            if (Object.prototype.hasOwnProperty.call(st.users, key)) {
+                const u = st.users[Number(key)];
+                if (u) {
+                    u.hasTicketForCurrent = false;
+                }
+            }
+        }
+    }
+
+    await saveStore(st);
+
+    const text =
+        `✅ Создан новый тираж #${st.draw.id}\n` +
+        `Статус: ${st.draw.status}\n\n` +
+        `Сейчас:\n` +
+        `• Событий: 0 из ${EVENTS_COUNT}\n` +
+        `• Билетов: 0\n\n` +
+        `Перейдите в "📝 Редактор событий", заведите ${EVENTS_COUNT} матчей,\n` +
+        `а затем нажмите "🟢 Открыть тираж".`;
+
+    await ctx.answerCbQuery('Новый тираж создан');
+    await ctx.editMessageText(text, {
+        parse_mode: 'HTML',
+        reply_markup: adminKb(st.draw),
+    });
+});
+
+bot.action('as:stats', async (ctx) => {
+  if (!isAdmin(ctx)) return ctx.answerCbQuery('Доступ запрещён.');
+  st = st || await loadStore();
+
+  const drawIdPrefix = `${st.draw.id}_`;
+  const tickets = st.tickets.filter(t => t.id.startsWith(drawIdPrefix));
+
+  const total = tickets.length;
+  const paid = tickets.filter(t => t.paid).length;
+  const unpaid = total - paid;
+
+  const uniqueUsers = new Set(tickets.map(t => t.userId)).size;
+
+  // банк по факту (только оплаченные)
+  const bankCrypto = tickets
+    .filter(t => t.paid)
+    .reduce((sum, t) => sum + Number(calcStakeCrypto(t.selections)), 0);
+
+  const bankRub = tickets
+    .filter(t => t.paid)
+    .reduce((sum, t) => sum + Number(calcStakeRUB(t.selections)), 0);
+
+  const text =
+`📊 <b>Статистика тиража #${st.draw.id}</b> (${st.draw.status})
+
+🎫 Билеты: <b>${total}</b>
+✅ Оплачено: <b>${paid}</b>
+⏳ Не оплачено: <b>${unpaid}</b>
+👥 Уникальных игроков: <b>${uniqueUsers}</b>
+
+💰 Банк (оплачено):
+• ~ <b>${bankRub.toFixed(0)}</b> ₽
+• ~ <b>${bankCrypto.toFixed(4)}</b> ${CURRENCY}
+
+ℹ️ Примечание: банк считается по <b>оплаченным</b> билетам.
+`;
+
+  await ctx.answerCbQuery('');
+  await safeEditMessage(ctx, text, {
+    inline_keyboard: [
+      [Markup.button.callback('🔄 Обновить', 'as:stats')],
+      [Markup.button.callback('⬅️ Админка', 'admin')],
+    ]
+  });
+});
+
 
 // --------------- Запуск ---------------
 (async () => {
   try {
     st = await loadStore();
+    console.log('🚀 Запускаю бота...');
 
-    console.log('🚀 Запускаю бота в POLLING режиме (NO PAYMENTS)...');
-
-        // Init TON provider for non-custodial payments
     await initTon();
 
-await bot.telegram.setMyCommands([
-      { command: 'help',   description: 'Помощь' },
-      { command: 'rules',  description: 'Правила' },
-      { command: 'events', description: 'Список событий' },
-      { command: 'my',     description: 'Мои билеты' },
-      // /admin намеренно не публикуем для всех; админы знают команду
-    ]);
+    // setMyCommands — НЕ критично. Если Telegram/сеть моргнула, бот всё равно должен жить.
+    try {
+      await bot.telegram.setMyCommands([
+        { command: 'start', description: 'Запустить бота' },
+        { command: 'help', description: 'Помощь' },
+        { command: 'rules', description: 'Правила' },
+        { command: 'events', description: 'Список событий' },
+        { command: 'my', description: 'Мои билеты' }
+      ]);
+      console.log('✅ setMyCommands OK');
+    } catch (e) {
+      console.warn('⚠️ setMyCommands failed (не критично):', e);
+    }
 
-    await bot.launch();
-    console.log(
-      `✅ Бот запущен. Draw #${st.draw.id} status=${st.draw.status}, EVENTS_COUNT=${EVENTS_COUNT}, STAKE_RUB(base)=${STAKE_RUB}`
-    );
+    await bot.launch({ dropPendingUpdates: true });
+
+    console.log(`✅ Бот запущен. Draw #${st.draw.id} status=${st.draw.status}`);
   } catch (error) {
-    console.error(`Failed to start bot: ${error}`);
-    process.exit(1);
+    console.error('Failed to start bot:', error);
+    // Не выходим из процесса
   }
 })();
 
+
+// Аккуратное завершение
 process.once('SIGINT', async () => {
-  console.log('SIGINT received, shutting down gracefully');
-  try { await bot.stop('SIGINT'); } catch {}
-  process.exit(0);
+    console.log('SIGINT received, shutting down gracefully');
+    try { await bot.stop('SIGINT'); } catch {}
+    process.exit(0);
 });
 
 process.once('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully');
-  try { await bot.stop('SIGTERM'); } catch {}
-  process.exit(0);
+    console.log('SIGTERM received, shutting down gracefully');
+    try { await bot.stop('SIGTERM'); } catch {}
+    process.exit(0);
 });
